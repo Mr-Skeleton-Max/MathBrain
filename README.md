@@ -280,6 +280,14 @@ Three variants tested:
 
 The residual variant works best: Layer 2 processes the *combination* of what actually happened and what Layer 1 predicted would happen. This is the most promising direction for scaling MathBrain -- each additional layer adds a new level of abstraction while preserving the voting-based, interpretable architecture.
 
+## Paper
+
+For the full theoretical motivation -- why categorical voting is a viable first principle, why bounded state becomes possible once you give up exact history reconstruction, and how memory-as-trigger differs from memory-as-retrieval -- please read the paper:
+
+> **[Bounded-State Categorical Voting for Online Sequence Learning: A White-Box Alternative to Length-Growing Black-Box Models](paper/mathbrain_arxiv_draft.pdf)**
+
+The paper covers the mathematical formulation in detail, including the complexity analysis, the wake update derivation, the sleep consolidation objective, and the biological correspondence argument. The README gives the intuition; the paper gives the proofs.
+
 ## Requirements
 
 - Python >= 3.8
@@ -290,13 +298,30 @@ Optional accelerators:
 - [MLX](https://github.com/ml-explore/mlx) >= 0.5.0 (Apple Silicon)
 - [PyTorch](https://pytorch.org/) >= 2.0.0 (CUDA)
 
+## A Note on Code Quality
+
+This codebase grew out of a solo research project. The author is a researcher first and not a professional software engineer -- the code works and the experiments are reproducible, but it is not as clean or well-organized as a production library. Apologies for any rough edges. If something is confusing, please open an issue and I'll be happy to explain.
+
+## Contributing
+
+This is an active research program with many open directions. I would love to collaborate:
+
+- **Discussions**: If you find the categorical-voting premise interesting (or flawed!), let's talk. Open an issue or reach out directly.
+- **Experiments**: Scaling to larger corpora, systematic baselines against n-gram/LSTM/Transformer, multi-layer architectures -- all need more hands.
+- **Theory**: The connections to information geometry, compressed sensing, and neural coding theory are largely unexplored.
+- **Engineering**: Better implementations, GPU kernels, edge deployment -- the sparse voting structure should be very hardware-friendly.
+
+PRs, issues, and ideas are all welcome.
+
+If this project interests you, a :star: on GitHub would be greatly appreciated -- it helps others discover this work!
+
 ## Citation
 
 ```bibtex
-@article{mathbrain2026,
+@article{li2026mathbrain,
   title   = {Bounded-State Categorical Voting for Online Sequence Learning:
              A White-Box Alternative to Length-Growing Black-Box Models},
-  author  = {Anonymous},
+  author  = {Li, Yuyue},
   year    = {2026}
 }
 ```

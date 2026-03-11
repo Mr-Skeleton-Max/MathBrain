@@ -6,7 +6,7 @@ setup(
     description="Neuroscience-inspired online sequence prediction with complementary learning systems",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    author="MathBrain Authors",
+    author="Yuyue Li",
     license="Apache-2.0",
     packages=find_packages(),
     python_requires=">=3.8",
