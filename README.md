@@ -143,7 +143,7 @@ These are early results on small-scale corpora. The claim is not SOTA on broad b
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/MathBrain.git
+git clone https://github.com/Mr-Skeleton-Max/MathBrain.git
 cd MathBrain
 pip install -e .
 ```
