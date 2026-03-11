@@ -2,11 +2,19 @@
 
 **Bounded-State Categorical Voting for Online Sequence Learning**
 
-No matter how sophisticated a sequence model becomes, the final act of next-token prediction is still a competition among discrete candidates. Even a modern large language model ends in voting. MathBrain takes this observation as a starting point and asks: *what if the entire architecture were designed around voting from the ground up?*
+MathBrain is an experimental sequence prediction architecture that does not store or attend over token history. Instead, it compresses all context into a bounded EMA state and predicts the next token through explicit memory voting -- achieving O(1) inference, online learning, and full interpretability by design.
 
-The result is a white-box system where memory is not retrieval but **context-triggered re-instantiation of categorical evidence**. The model does not reconstruct continuous history. It preserves just enough bounded evidence for the correct candidate to win the vote. This makes three things possible that are difficult in conventional architectures: **constant-time inference** regardless of sequence length, **continual online learning** without replay buffers, and **full interpretability** where every prediction can be traced to explicit voting evidence.
+> **TL;DR**: Transformers grow state with sequence length. MathBrain doesn't. It treats next-token prediction as a voting problem over two explicit memory systems (fast B + slow A), with constant memory regardless of how many tokens it has seen.
 
-## The Core Idea
+## Key Ideas
+
+- **Prediction is voting.** Every next-token prediction is a categorical competition. The architecture is designed around this from the ground up.
+- **History should be compressed, not stored.** Multi-timescale EMA states capture "when did I last see this pattern" without keeping the full sequence.
+- **Voting tolerates compression.** You don't need exact replay to rank the correct candidate above competitors -- sufficient evidence is enough.
+- **Two memories, one goal.** Fast episodic memory B (hippocampus) writes instantly; slow structured memory A (neocortex) consolidates during sleep. A can take over most of B's function.
+- **Everything is inspectable.** Every prediction traces back to specific memory entries, source slots, and feature vectors. No black box.
+
+## How It Works
 
 Consider predicting the next word after *"the cat sat on the"*. A transformer must attend over all previous tokens. MathBrain works differently:
 
@@ -279,6 +287,19 @@ Three variants tested:
 | Two-layer, residual + soft | ~96% |
 
 The residual variant works best: Layer 2 processes the *combination* of what actually happened and what Layer 1 predicted would happen. This is the most promising direction for scaling MathBrain -- each additional layer adds a new level of abstraction while preserving the voting-based, interpretable architecture.
+
+## Current Status
+
+This is an active research project in early-to-mid stage:
+
+- Core architecture (hash retina, EMA state, phi encoding, B memory, A knowledge, wake-sleep) -- implemented and working
+- Single-layer system reaches 87-93% next-token accuracy on small corpora (TinyStories, PTB)
+- Multi-layer extension shows 93% → 97% improvement -- most promising scaling direction
+- Dream sleep (corpus-free consolidation) -- working but residual B improvement still small
+- Large-scale evaluation (10K+ stories, systematic baselines vs n-gram/LSTM/Transformer) -- not yet done
+- Abstraction beyond linear interaction space -- open problem (multi-layer is the current approach)
+
+The architecture is validated at small scale. The open question is how far it can go.
 
 ## Paper
 
