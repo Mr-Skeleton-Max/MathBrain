@@ -109,5 +109,5 @@ This is a solo research project seeking collaborators and lab support. The goal 
 
 Two other artifacts emerged from this research journey:
 
-- **BubbleStream**: An inference-layer context management framework for existing LLMs. Functional prototype, not open-sourced.
+- **[BubbleStream](https://github.com/YOUR_USERNAME/BubbleStream)**: An inference-layer context management framework for existing LLMs. Dual-stream architecture (thinking + memory), 94% memory precision with 16K effective context. Functional prototype, open-sourced separately.
 - **Graph-based code indexer**: A structural code analysis tool based on graph representations. The underlying idea could extend to vibe-coding editors, PCB layout tools, and other structured-document applications.
