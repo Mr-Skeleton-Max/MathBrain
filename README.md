@@ -2,7 +2,7 @@
 
 **Bounded-State Categorical Voting for Online Sequence Learning**
 
-MathBrain is an experimental sequence prediction architecture that does not store or attend over token history. Instead, it compresses all context into a bounded EMA state and predicts the next token through explicit memory voting -- achieving O(1) inference, online learning, and full interpretability by design.
+MathBrain is an experimental sequence prediction architecture that does not store or attend over token history. Instead, it compresses all context into a bounded EMA state and predicts the next token through explicit memory voting -- achieving O(1) inference and O(logN) train(experimental,but stable), online learning, and full interpretability by design.
 
 > **TL;DR**: Transformers grow state with sequence length. MathBrain doesn't. It treats next-token prediction as a voting problem over two explicit memory systems (fast B + slow A), with constant memory regardless of how many tokens it has seen.
 
