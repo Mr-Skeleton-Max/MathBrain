@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary files
+*.pkl
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Model checkpoints
+models/
+checkpoints/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
+# Logs
+*.log
+.codex_logs/
+
+# Large datasets (keep small demo files)
+datasets/tinystories_full.txt
+datasets/natural/
+datasets/natural_clean/
+datasets/tinystories/

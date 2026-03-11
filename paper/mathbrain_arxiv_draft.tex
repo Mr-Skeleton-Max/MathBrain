@@ -1,0 +1,420 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{microtype}
+\usepackage{url}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\title{Bounded-State Categorical Voting for Online Sequence Learning\\
+\large A White-Box Alternative to Length-Growing Black-Box Models}
+\author{Anonymous Author}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We propose a different starting point for sequence modeling: if both perceptual inputs and behavioral outputs are ultimately handled as categorical responses, then a sequence model need not reconstruct continuous history in full; it only needs to preserve enough bounded evidence to rank the correct categorical response above competing alternatives. From this viewpoint, memory is not literal retrieval but a context-triggered re-instantiation of categorical evidence. Based on this premise, we introduce a white-box architecture for online sequence learning built from five components: deterministic hash-based lexical coding, multi-timescale exponential moving average (EMA) state compression, a bounded positional feature map, a sparse short-term voting memory, and a low-rank long-term knowledge store trained by sleep-style consolidation. The resulting system supports continual online inference, continual online learning, and an inspectable decision path. After bounded-state compression, inference time and memory usage are constant with respect to processed sequence length. In early experiments, the system reaches 87.0\% next-token accuracy in wake-only mode on \texttt{tinystories\_11\_20.txt}, 85.6\% after transferring predictive content into the long-term module alone, 84--86\% A-only and 92--93\% A+B on \texttt{tinystories\_10.txt}, 85\% on the first 200 lines of PTB, 100\% on a 230-word memory test, and shows controlled zero-shot lexical ecological generalization. We present this work as a research program: an interpretable, bounded-state alternative to black-box sequence models whose complexity grows with explicit context replay.
+\end{abstract}
+
+\section{Introduction}
+The standard question in modern sequence modeling is how to preserve or retrieve more history. This question has produced increasingly sophisticated mechanisms for caching, attending, compressing, or retrieving past context. Yet it leaves one deeper assumption largely untouched: that accurate next-token prediction fundamentally requires access to a detailed replay of past sequence content.
+
+This paper starts from a different assumption. We argue that once input and output behavior are viewed through the lens of categorical response, sequence learning can be reformulated. The model need not reconstruct continuous history in full detail. Instead, it must preserve enough bounded evidence for the correct categorical response to win a structured vote among alternatives. Put differently, no matter how complicated the internal mechanism becomes, the final act of next-token prediction is still a competition among discrete candidates. In that precise sense, even a modern large language model still ends in voting.
+
+This shift is motivated by two ideas. First, perceptual and linguistic processing appears to depend on discretized internal responses to salient structure, rather than on literal storage of raw signal. Second, voting among categorical responses requires a very different level of precision from exact continuous reconstruction. That lower precision requirement opens the door to bounded state, sparse memory, and explicit online learning.
+
+The architecture introduced here is built around this premise. It treats sequence modeling not as black-box function approximation over an ever-growing history, but as bounded-state categorical voting driven by explicit memories. The resulting system combines a deterministic lexical frontend, a multi-timescale state compressor, a bounded feature map, a fast short-term voting memory, and a slower long-term factorized memory that absorbs patterns through consolidation.
+
+The claim of this paper is not that the present system has already surpassed large-scale language models on broad benchmarks. The claim is more specific: \emph{if discrete response selection is treated as the first principle, then sequence learning admits a different architectural regime---one based on bounded state, voting-style memory, continual online updates, and strong interpretability.}
+
+\paragraph{Contributions.}
+This draft makes five contributions:
+\begin{enumerate}[leftmargin=1.5em]
+    \item It proposes categorical response selection, rather than continuous history reconstruction, as the first principle for a new sequence-learning regime.
+    \item It formulates memory as context-triggered categorical re-instantiation rather than literal database-style retrieval.
+    \item It introduces a concrete white-box architecture whose inference and memory usage are constant with respect to processed sequence length after bounded-state compression.
+    \item It shows early evidence that a low-rank long-term module can absorb most of the predictive content of a fast short-term memory.
+    \item It outlines a broader research program around bounded-state sequence modeling, online learning, and explicit memory.
+\end{enumerate}
+
+\section{Notation and Implementation Conventions}
+Table~\ref{tab:notation} lists the symbols used in the implementation-aligned part of the paper.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{p{2.0cm} p{3.2cm} p{7.0cm}}
+\toprule
+Symbol & Shape & Meaning in the current implementation \\
+\midrule
+$K$ & scalar & Slot-space size used by \texttt{HashRetina} \\
+$N$ & scalar & Number of EMA timescales \\
+$D$ & scalar & Feature dimension used by the positional encoder and by stored $B$ vectors \\
+$d$ & scalar & Rank of the long-term factorization \texttt{CP\_RANK} \\
+$c_w$ & sparse map & Slot-count dictionary returned by \texttt{HashRetina.encode(w)} \\
+$Q_i$ & $\mathbb{R}^{N}$ & EMA state row associated with slot $i$ \\
+$\phi_i$ & $\mathbb{R}^{D}$ & Feature vector produced for active slot $i$ \\
+$\widehat{\phi}_i$ & $\mathbb{R}^{D}$ & Rowwise normalized feature vector used in scoring and wake updates \\
+$b_{s,t}$ & $\mathbb{R}^{D}$ & Sparse short-term edge vector stored for source-target slot pair $(s,t)$ \\
+$E_{\mathrm{src}}[s]$ & $\mathbb{R}^{d\times D}$ & Long-term source factor for slot $s$ \\
+$E_{\mathrm{tgt}}[t]$ & $\mathbb{R}^{d\times D}$ & Long-term target factor for slot $t$ \\
+$A[s,t]$ & $\mathbb{R}^{D}$ & Reconstructed long-term feature vector for edge $(s,t)$ \\
+$\ell_B(t)$ & scalar & Slot score contributed by short-term memory \\
+$\ell_A(t)$ & scalar & Slot score contributed by long-term memory \\
+\bottomrule
+\end{tabular}
+\caption{Symbols and shapes used in the implementation-aligned formulation.}
+\label{tab:notation}
+\end{table}
+
+\section{Categorical Response as First Principle}
+The conceptual starting point of this work is simple: the model's interaction with the world is mediated through discrete, enumerable response spaces rather than through perfect reconstruction of continuous reality. Inputs may originate in complex physical signals, but the model only acts on features that trigger internal categorical responses. Outputs are also selections among discrete candidates.
+
+From this viewpoint, sequence modeling changes character. The objective is no longer to preserve a continuously faithful reconstruction of everything that happened before. The objective is to preserve enough state for the right category to be selected when the next response must be made. This is also why the present work parts ways with the dominant long-context framing: if the end task is categorical selection, then the central problem is not exhaustive retrieval of history, but preservation of decision-relevant pressure on the current vote.
+
+This leads to three consequences.
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{Only categorical systems can vote.} Voting is meaningful only when the response space is discrete.
+    \item \textbf{Voting tolerates compression.} To rank the correct response above competitors, the system needs sufficient evidence, not exact replay of past signal.
+    \item \textbf{Memory becomes trigger-based.} What matters is not exact retrieval of stored history, but the re-activation of the right categorical evidence under the right state.
+\end{itemize}
+
+We therefore adopt the following thesis:
+\begin{quote}
+Because input and output spaces are categorical and enumerable, sequence modeling need not reconstruct continuous history; it only needs to preserve enough bounded evidence for correct categorical voting.
+\end{quote}
+
+\section{Memory Is Trigger, Not Retrieval}
+A central consequence of the previous section is a new interpretation of memory. In this work, memory is not treated as a database process. It is not defined by exact read/write access to a fully stored past. Instead, memory is treated as \emph{context-triggered categorical reconstruction}: under the right state, the system re-instantiates enough evidence for the relevant category to emerge.
+
+In informal terms, memory is not retrieval but a triggered illusion under the right state. This wording is intentionally provocative, but the technical point is precise: the system does not need to recover the past itself; it needs to recover the correct pressure on the current categorical decision.
+
+This idea also explains why bounded temporal encoding matters. A bounded-state temporal code such as multi-timescale EMA allows the model to represent the activation history of a category without expanding explicit time structure. The system does not store time as a replay buffer. It stores time as state. In the current implementation, the immediate trigger variable is the $Q$ state itself: the active rows of $Q$ encode which categories are currently alive, at what relative strengths, and across which decay horizons. If the present $Q$ state aligns with previously learned source conditions, then the corresponding evidence is re-instantiated by inner products in $B$ and $A$.
+
+\section{Why Bounded State Becomes Possible}
+If memory were literal retrieval, then compression would face a hard obstacle: exact recall capacity would scale directly with stored detail. In that regime, finite parameters would eventually fail to carry growing history. This is one reason the present work rejects precise retrieval as the first principle.
+
+By contrast, once the goal is recast as categorical voting, the precision requirement changes dramatically. Local evidence need only shift the correct candidate above competing alternatives. This makes bounded compression plausible. The model does not need to remember everything; it needs to preserve whatever is still decision-relevant.
+
+We therefore treat thinking as strongly autoregressive and incrementally recursive: each step depends on the current local state plus a compressed carry-over of the past, rather than on instantaneous replay of the entire history.
+
+\section{Implemented Architecture}
+This section defines the implementation actually used in the current code path. We restrict attention to the default research setting used by the current experiments: cosine-chaos positional encoding, energy-style wake updates, and MLX-based sleep consolidation.
+
+Let $K$ denote the slot-space size, $N$ the number of EMA timescales, $D$ the feature dimension used by the positional encoder, and $d$ the CP-style rank used by the long-term memory. In the current implementation, $D$ equals \texttt{cfg.d}; for chaos mode this is \texttt{D\_PHI}, while the long-term rank is \texttt{CP\_RANK}.
+
+\subsection{HashRetina: token to sparse slot counts}
+For a token $w$, the frontend constructs the padded string \texttt{\^{}w\$} and extracts character $n$-grams for each scale in a finite set $\mathcal{N}$ (default: $\mathcal{N}=\{3\}$). Each $n$-gram is mapped by a deterministic hash into a slot in $\{0,\dots,K-1\}$. The encoder returns a finite count dictionary
+\begin{equation}
+c_w: \{0,\dots,K-1\} \to \mathbb{N},
+\end{equation}
+where $c_w(j)$ is the total multiplicity of hashed $n$-grams landing in slot $j$. In the implementation, different $n$-gram scales are separated by prefixing the hash input with the scale index.
+
+This frontend is not a semantic embedding layer. Its main role is to produce a bounded sparse slot representation while allowing partial slot sharing across morphologically related words.
+
+\subsection{Multi-timescale EMA state}
+The context state is stored as a sparse set of active slot rows with values in $\mathbb{R}^{N}$. Let $Q_i(t)\in\mathbb{R}^N$ denote the row associated with slot $i$ at step $t$, and let
+\begin{equation}
+\rho = (\rho_1,\dots,\rho_N) \in (0,1)^N
+\end{equation}
+be the per-timescale retention vector.
+
+The implemented update is not written as a single closed form in the code. Operationally it is:
+\begin{enumerate}[leftmargin=1.5em]
+    \item decay every currently active row elementwise,
+    \begin{equation}
+    Q_i(t) \leftarrow Q_i(t) \odot \rho;
+    \end{equation}
+    \item remove rows whose maximum magnitude falls below a small threshold;
+    \item for every slot $j$ present in the current count dictionary $c_w$, add the scalar count $c_w(j)$ to \emph{all} timescales of that row,
+    \begin{equation}
+    Q_j(t+1) \leftarrow Q_j(t) + c_w(j)\mathbf{1}_N.
+    \end{equation}
+\end{enumerate}
+
+Thus the current token contributes equally to all timescales at insertion time; timescale separation arises through subsequent decay. Active rows are those whose row norm exceeds the threshold used in the implementation.
+
+\subsection{EMA thresholding and active-slot saturation}
+The bounded-state interpretation of EMA can be stated briefly. Fix a slot space of size $K$, a decay vector $\rho\in(0,1)^N$, and an activation threshold $\theta_Q>0$. Suppose the per-step inserted count into any slot is bounded above by $c_{\max}$. Then every coordinate of every EMA row is bounded by its geometric-series envelope, namely
+\begin{equation}
+Q_i^{(n)}(t) \le \frac{c_{\max}}{1-\rho_n}.
+\end{equation}
+Hence the online state cannot grow with raw history length in an unbounded way. After thresholding, the number of active rows is bounded by the finite slot budget and threshold rule; in particular, it is independent of processed sequence length. The stronger empirical phenomenon observed in this project is \emph{active-slot saturation}: beyond a sufficiently long context, the number of rows surviving thresholding stabilizes in a bounded range determined by slot budget, decay rates, and thresholding, rather than by raw history length itself. This is the exact sense in which EMA turns temporal extent into bounded state.
+
+\subsection{Cosine-chaos feature map}
+The standard positional feature map in the present paper is the cosine-chaos encoder. For a matrix of active EMA rows $Q_{\mathrm{act}}\in\mathbb{R}^{m\times N}$, define
+\begin{equation}
+\widetilde{Q} = Q_{\mathrm{act}} \odot \alpha_{\mathrm{scale}},
+\end{equation}
+where $\alpha_{\mathrm{scale}}\in\mathbb{R}^{N}$ is the inverse-weight vector used in the implementation. Let $P\in\mathbb{R}^{D\times N}$ be the fixed random projection matrix. The initial projection is
+\begin{equation}
+E = P\widetilde{Q}^{\top} \in \mathbb{R}^{D\times m}.
+\end{equation}
+The recurrence starts from $M_0=0\in\mathbb{R}^{D\times m}$ and iterates
+\begin{equation}
+M_t = \cos\!\big(\alpha (\mathrm{shift}(M_{t-1}) + E)\big), \qquad t=1,\dots,L,
+\end{equation}
+where $\mathrm{shift}(\cdot)$ is the cyclic shift along the feature axis, $\alpha$ is the chaos parameter, and $L$ is the number of folds. The final feature matrix is
+\begin{equation}
+\phi = M_L^{\top} \in \mathbb{R}^{m\times D}.
+\end{equation}
+
+In the current default setting, $\alpha=2$, motivated by the Lyapunov calculation
+\begin{equation}
+\lambda = \log(\alpha/2),
+\end{equation}
+which places $\alpha=2$ at the edge of chaos under the mean-field approximation used in the accompanying analysis notes. This analysis motivates the default parameter choice, but the implemented feature map is exactly the recurrence above.
+
+\subsection{Short-term memory $B$ as a sparse edge map}
+The short-term memory is implemented as a sparse hash table over ordered slot pairs. Each stored edge has the form
+\begin{equation}
+B[(s,t)] = b_{s,t} \in \mathbb{R}^{D},
+\end{equation}
+where $s$ is a source slot, $t$ is a target slot, and $b_{s,t}$ is a feature-space vector. The implementation also stores a last-update time for each edge and applies lazy decay at access time.
+
+This means that $B$ is conceptually a sparse collection of exact voting traces, but mathematically in the code it is not represented as a dense tensor. It is a finite edge map from slot pairs to $D$-dimensional vectors. A useful intuition is the transpose view of the same object. In a dense formulation one may imagine a tensor of size $V_{\mathrm{tgt}} \times (V_{\mathrm{src}} \times D)$, where each target stores the source-conditioned feature pattern that supports it. Reading the same structure transversely gives $V_{\mathrm{src}} \times (D \times V_{\mathrm{tgt}})$: for a currently active source slot and its feature vector, one asks which target conditions are most compatible. The implemented sparse edge map realizes exactly this source-conditioned voting view without materializing the dense tensor.
+
+\subsection{Long-term memory $A$ as slice-wise factorization}
+The long-term memory stores two dictionaries of slot-indexed matrices,
+\begin{equation}
+E_{\mathrm{src}}[s], E_{\mathrm{tgt}}[t] \in \mathbb{R}^{d\times D}.
+\end{equation}
+For a source-target pair $(s,t)$, the corresponding feature vector reconstructed by $A$ is
+\begin{equation}
+A[s,t] = \sum_{r=1}^{d} E_{\mathrm{tgt}}[t]_{r,:} \odot E_{\mathrm{src}}[s]_{r,:} \in \mathbb{R}^{D}.
+\end{equation}
+This is the precise object returned by the single-edge query routine in the current implementation.
+
+\section{Exact-Trace $B$ and Embedded $A$}
+The distinction between $B$ and $A$ is not merely computational; it is the core epistemic division of the model.
+
+\paragraph{B as exact trace.}
+The short-term memory stores precise episodic voting traces. It is tied to discrete observed co-activations and therefore supports exact but weakly generalized behavior.
+
+\paragraph{A as generalized structure.}
+The long-term module replaces explicit trace storage with a low-rank embedding structure. In doing so, it discovers regularities across slots, clusters similar trace patterns, and supports generalization unavailable to purely exact retrieval.
+
+This is the core reason that $A$ can eventually take over most of $B$'s predictive function: the system is not just copying traces, but factorizing them into a more structured space.
+
+\section{Prediction as Voting}
+Given a token context, the system proceeds as follows:
+\begin{enumerate}[leftmargin=1.5em]
+    \item encode each token into slots,
+    \item update the bounded EMA state $Q$,
+    \item extract active slots and compute bounded feature vectors $\phi$,
+    \item score target slots through both $B$ and $A$,
+    \item decode slot scores into lexical predictions.
+\end{enumerate}
+
+\begin{algorithm}[t]
+\caption{One-step inference and local wake update}
+\begin{algorithmic}[1]
+\State Encode current token into sparse slot counts $c_w$ with \texttt{HashRetina}
+\State Decay active rows of $Q$, compact inactive rows, and insert $c_w$
+\State Select active slots $\{s_i\}$ from $Q$ and compute $\phi_i$, then normalize to $\widehat{\phi}_i$
+\ForAll{candidate target slots $t$ touched by sparse support}
+    \State Compute $\ell_B(t)=\sum_i \langle b_{s_i,t}, \widehat{\phi}_i \rangle$
+    \State Compute $\ell_A(t)=\langle E_{\mathrm{tgt}}[t], \sum_i E_{\mathrm{src}}[s_i]\odot \widehat{\phi}_i \rangle_F$
+\EndFor
+\State Predict the next response by ranking targets with $\ell(t)=\ell_A(t)+\ell_B(t)$
+\ForAll{true next-token target slots $t$}
+    \State Write to $B$ with $\Delta b_{s_i,t}=\eta\, [1-(\gamma s_A+s_B)]\,\widehat{\phi}_i$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Let $\phi_i\in\mathbb{R}^{D}$ denote the feature vector associated with active slot $s_i$, and let
+\begin{equation}
+\widehat{\phi}_i = \frac{\phi_i}{\|\phi_i\|_2 + 10^{-8}}.
+\end{equation}
+The implementation normalizes feature vectors before both $A$-strength and $B$-strength computations. When the same source slot is paired with multiple target slots during wake, the normalized source feature is repeated across those target pairs.
+
+At slot level,
+\begin{equation}
+\ell(j)=\ell_B(j)+\ell_A(j).
+\end{equation}
+The long-term score is computed by first aggregating a source-conditioned context tensor
+\begin{equation}
+C_A = \sum_i E_{\mathrm{src}}[s_i] \odot \widehat{\phi}_i \in \mathbb{R}^{d\times D},
+\end{equation}
+then scoring every target slot $t$ by Frobenius inner product,
+\begin{equation}
+\ell_A(t) = \langle E_{\mathrm{tgt}}[t], C_A \rangle_F.
+\end{equation}
+
+The short-term score is computed from the stored edge vectors:
+\begin{equation}
+\ell_B(t) = \sum_i \langle b_{s_i,t}, \widehat{\phi}_i \rangle,
+\end{equation}
+where the sum only ranges over edges actually present in the sparse edge map. Prediction is therefore the merge of episodic evidence and generalized evidence. The operative point is that the model does not retrieve a stored sentence or a stored event. It accumulates local votes from those source-conditioned traces whose trigger conditions are currently active in $Q$.
+
+\section{Wake--Sleep Learning}
+\subsection{Wake: rapid local updates}
+Wake learning writes rapidly into $B$ using only local information. For each active source slot $s_i$ and each target slot $t$ of the next token, the implementation computes
+\begin{equation}
+s_B(s_i,t) = \langle b_{s_i,t}, \widehat{\phi}_i \rangle,
+\end{equation}
+with $s_B=0$ if the edge is absent, and
+\begin{equation}
+s_A(s_i,t) = \Big\langle \mathrm{vec}\big(E_{\mathrm{src}}[s_i] \odot \widehat{\phi}_i\big),\; \mathrm{vec}\big(E_{\mathrm{tgt}}[t]\big) \Big\rangle,
+\end{equation}
+where $\widehat{\phi}_i$ is broadcast across the first axis of $E_{\mathrm{src}}[s_i]$. This is exactly the flattened matrix product used by the current cached implementation of $A$-strength during wake. The implemented energy gap is then
+\begin{equation}
+g(s_i,t) = 1 - (\gamma \, s_A(s_i,t) + s_B(s_i,t)),
+\end{equation}
+with $\gamma = \texttt{GAMMA\_DECAY}$ in the current code path. The wake update writes
+\begin{equation}
+\Delta b_{s_i,t} = \eta \, g(s_i,t) \, \widehat{\phi}_i.
+\end{equation}
+This is the default update used by the current experiments. Its purpose is to prevent high-frequency patterns from growing without bound once $A$ and $B$ already provide sufficient support. Crucially, wake learning is online and does not require full backpropagation-through-time.
+
+\subsection{Sleep: compression of traces into structure}
+Sleep gathers the accumulated $B$ entries and trains $A$ to approximate targets of the form
+\begin{equation}
+\mathrm{target}_{ij}=\gamma A_{\text{old}}[i,j]+B[i,j],
+\end{equation}
+or an adaptive-$\gamma$ variant when slot-wise decay is enabled. More precisely, if the sampled wake edges are $(s_k,t_k,b_k)$, then the old long-term prediction is
+\begin{equation}
+a^{\mathrm{old}}_k = A[s_k,t_k] \in \mathbb{R}^{D},
+\end{equation}
+and the sleep target is
+\begin{equation}
+y_k = \gamma_k a^{\mathrm{old}}_k + b_k,
+\end{equation}
+with either a global $\gamma_k=\gamma$ or an adaptive slot-dependent coefficient in the current implementation.
+
+The trainable parameters during sleep are stored internally as arrays of shape $(D,d)$ per slot for computational reasons, but are converted back to the public $(d,D)$ representation after optimization. The new-sample loss is
+\begin{equation}
+\mathcal{L}_{\mathrm{new}} = \frac{1}{n_{\mathrm{new}}} \sum_k \ell\big(A_{\theta}(s_k,t_k)-y_k\big),
+\end{equation}
+where $\ell$ is either elementwise MSE or Huber loss in the implementation. When rehearsal is enabled, additional pairs are sampled from already-known slots and penalized toward decayed old predictions:
+\begin{equation}
+\mathcal{L}_{\mathrm{reh}} = \frac{1}{n_{\mathrm{reh}}} \sum_u \ell\big(A_{\theta}(\tilde{s}_u,\tilde{t}_u)-\tilde{y}_u\big).
+\end{equation}
+The full sleep objective is
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\mathrm{new}} + \mathcal{L}_{\mathrm{reh}},
+\end{equation}
+optimized with AdamW in the current MLX implementation. Thus, optimization appears in the architecture as a consolidation tool rather than as the general learning principle of the whole system.
+
+The philosophical meaning of sleep is simple: exact traces in $B$ are distilled into generalized structure in $A$.
+
+\section{Complexity Claim}
+We state the complexity claim carefully.
+
+\paragraph{Sequence-length complexity.}
+Once history has been compressed into bounded EMA state, inference time and memory usage are \emph{constant with respect to total processed sequence length}. The system therefore avoids the growing cost of explicit context replay.
+
+\paragraph{Why the claim is well-defined.}
+The $O(1)$ claim is made with respect to already-processed sequence length, not with respect to every quantity in the model. Its key structural assumption is that EMA-based temporal encoding yields active-slot saturation under a fixed activity threshold: beyond a sufficiently long context, the number of active rows that survive thresholding is bounded by the slot budget and threshold rule rather than by raw history length. Under this bounded-active-support regime, the online path operates at state-model scale: it carries a fixed-dimensional state, computes fixed-dimensional features, and reads or writes only sparse slot-conditioned traces. In practice there remains a nonzero constant base cost from hashing, thresholding, sparse bookkeeping, and candidate decoding, but that cost does not grow with processed context length.
+
+\paragraph{Training complexity.}
+Wake training is linear in the number of observed positions, with bounded local computation per position under sparse active support. The architecture does not require backpropagation-through-time, so the online training memory footprint is constant with respect to sequence length. Feature-generation terms tied to the positional encoder can be precomputed or cached, so a conservative statement is linear time in the number of observed positions with constant sequence-length memory. Sleep training is separate and depends on the number of stored $B$ entries and the rank of the long-term factorization.
+
+\paragraph{Parallel wake aggregation.}
+Because wake writes are local edge updates, they can also be accumulated in parallel over shards and merged afterward by weighted summation on coincident slot pairs. This observation is not yet the center of the present experiments, but it is a genuine architectural property of the implemented sparse update rule.
+
+\paragraph{Scope of the claim.}
+This is not a claim that every aspect of computation is constant in vocabulary size, slot count, or total stored memory size. It is a claim that the architecture removes dependence on raw context length by compressing history into bounded state.
+
+\paragraph{Implementation alignment.}
+For mathematical precision, the complexity claim in this paper refers to the implemented bounded-state path: hash-based token coding, sparse EMA state, cosine-chaos feature generation in fixed dimension, sparse edge-map $B$, and factorized long-term memory $A$. It does not claim constant dependence on all other quantities in the implementation. What is claimed strictly is constant dependence on processed sequence length after bounded-state compression, together with constant online training memory due to the absence of BPTT.
+
+\paragraph{Audit note.}
+Two implementation details matter for mathematical accuracy. First, the EMA insertion step adds the current slot count equally to all timescales and relies on subsequent decay to separate timescales. Second, the wake update uses normalized feature vectors $\widehat{\phi}$ rather than raw $\phi$. Both points are reflected explicitly in the equations above because they materially affect the implemented dynamics.
+
+\section{Interpretability}
+The model is inspectable at every level:
+\begin{itemize}[leftmargin=1.5em]
+    \item lexical slot activations from hash coding,
+    \item multi-timescale EMA state $Q$,
+    \item bounded voting features $\phi$,
+    \item explicit short-term voting traces in $B$,
+    \item low-rank generalized factors in $A$.
+\end{itemize}
+This is not post hoc explanation. The decision path is part of the architecture itself.
+
+\section{Sparsity and Parameter Efficiency}
+The architecture is sparse by construction. The frontend produces sparse slot counts, thresholding keeps only active rows of $Q$, wake writes only to touched source-target pairs, and $A$ replaces dense pairwise storage with a low-rank factorization over slots. As a result, most potential connections are never materialized.
+
+This sparsity is not merely an implementation trick. It is part of the mathematical regime. Because prediction is formulated as categorical voting under bounded active support, the model only needs to preserve the edges and factors that carry decision-relevant pressure. In that sense, parameter efficiency follows from the problem reformulation itself: the system does not spend capacity on reconstructing full history, only on maintaining sparse evidence and compressible structure.
+
+\section{Biological Correspondence}
+The system was not designed as a literal imitation of biology. The design process was mathematical first. However, the resulting structure aligns naturally with several biological themes: fast and slow learning systems, bounded decaying context traces, continual online processing, and categorical competition among candidate responses. We therefore treat biological correspondence as corroborating evidence, not as the primary source of justification. The claim is not that the present equations prove neural identity with the brain. The more modest claim is that, once one follows the categorical-voting logic to its conclusion, human cognition itself begins to look compatible with this regime: memory appears less like database retrieval and more like context-sensitive re-evocation under bounded ongoing state.
+
+\section{Early Empirical Evidence}
+The current empirical package should be interpreted as evidence of viability rather than as a finished benchmark suite. Table~\ref{tab:results} summarizes the most stable results currently suitable for discussion.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{p{3.2cm} p{4.3cm} p{5.3cm}}
+\toprule
+Setting & Evaluation & Result \\
+\midrule
+\texttt{tinystories\_10.txt} & B-only next-token accuracy & 87.0\% \\
+\texttt{tinystories\_10.txt} & A-only after 10 cycles & 84--86\% \\
+\texttt{tinystories\_10.txt} & A+B combined & 92--93\% \\
+\texttt{tinystories\_11\_20.txt} & Wake-only accuracy at cycle 20 & 87.0\% (1342/1542) \\
+\texttt{tinystories\_11\_20.txt} & A-only after sleep consolidation & 85.6\% (1320/1542) \\
+PTB first 200 lines & early next-token experiment & 85\% \\
+230-word memory test & memorization accuracy & 100\% \\
+Controlled lexical ecology & zero-shot transfer (e.g., dog$\rightarrow$wolf, not cat) & positive \\
+\bottomrule
+\end{tabular}
+\caption{Early experimental results. Some are stable headline results; others remain best treated as internal results pending broader benchmark packaging.}
+\label{tab:results}
+\end{table}
+
+\paragraph{A takes over B.}
+The most important empirical phenomenon is not the absolute score alone, but the fact that the long-term module can absorb most of the predictive content of the short-term module. On \texttt{tinystories\_11\_20.txt}, wake reaches 87.0\% and the A-only model after sleep remains at 85.6\%. On \texttt{tinystories\_10.txt}, A-only reaches 84--86\% while A+B reaches 92--93\%. This indicates that sleep is not cosmetic: it transfers predictive structure into compressed long-term knowledge.
+
+\paragraph{Controlled generalization.}
+In controlled tests, an unseen lexical item occupying a similar ecological niche can inherit plausible next-token behavior through shared slot structure and context dynamics. For example, a context learned for \emph{dog} may generalize to \emph{wolf} but not to a less aligned token such as \emph{cat}. We present this as early evidence of ecological generalization, not as a claim of broad semantic competence.
+
+\section{What This Challenges}
+The main target of this work is not any one architecture, but a prevailing assumption: that long-range sequence modeling is fundamentally a problem of preserving or retrieving as much history as possible. We challenge that assumption directly.
+
+Our counter-claim is that once discrete response selection is treated as the first principle, the central problem changes. The model no longer needs exact history reconstruction. It needs bounded, decision-relevant evidence. This shift may enable a different family of systems with explicit memory, bounded state, and online learning as native properties.
+
+\section{Limitations}
+This draft represents an active research program, not a complete benchmark study. Several limitations remain:
+\begin{itemize}[leftmargin=1.5em]
+    \item Results are currently strongest on synthetic and small-scale corpora.
+    \item Baseline comparisons against standard sequence models are not yet systematized.
+    \item Some claims, especially around scaling and efficiency, are more rigorously motivated than comprehensively benchmarked.
+    \item The current empirical package is uneven: strong internal logs and repeated observations exist, but not all have yet been standardized into paper-ready benchmark tables.
+\end{itemize}
+
+\section{Research Program}
+We see four immediate directions.
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{Systematic benchmarking}: compare against $n$-gram, RNN/LSTM, transformer, linear-attention, and state-space baselines under matched context and memory budgets.
+    \item \textbf{Scaling laws}: characterize performance as a function of slot count, feature dimension, factor rank, and sparsity budget.
+    \item \textbf{Generalization diagnostics}: test ecological categories, syntax-like regularities, and compositional transfer beyond direct memorization.
+    \item \textbf{Hardware-efficient implementations}: exploit sparsity, hashing, and parallel operations to push the architecture toward edge deployment and continual-learning settings.
+\end{enumerate}
+
+\section{Conclusion}
+This work proposes a different starting point for sequence modeling: bounded-state categorical voting rather than explicit replay of continuous history. From this starting point, memory becomes trigger rather than retrieval, temporal structure becomes bounded state rather than expanding context, and learning becomes a division between rapid exact trace storage and slower structural consolidation. Early experiments suggest that this regime is viable. We do not claim that the current system is already a replacement for large-scale autoregressive language models. We do claim that it opens a technically concrete and intellectually distinct research direction that is both interesting and testable. If the central premise is right, then the payoff is larger than one architecture: it suggests that both machine sequence modeling and, perhaps in a compatible but not identical sense, brain-like cognition may be better understood as bounded categorical voting than as exact replay of growing history.
+
+\appendix
+\section{Research Background}
+This project emerged from a broader line of inquiry into memory management for long-context language systems. One earlier engineering prototype, internally called \emph{Bubble Stream}, used staged inference, memory block packing, and dynamic insertion into transformer context windows. In a controlled setup, it achieved 94\% memory precision over 32K cumulative dialogue using only 16K active context. That prototype is not the subject of this paper, but it helped motivate the present architecture by showing that memory behavior can depend more on memory-management structure than on raw context length alone.
+
+\section{Status of the Evidence}
+The results in this draft are based on an actively iterated codebase with multiple documented design cycles. Some results are already stable enough for inclusion as headline evidence; others remain best treated as research observations pending standardized benchmark packaging. The purpose of the present draft is to communicate the architecture and research direction clearly enough for expert discussion, supervision, and collaborative development.
+
+\end{document}
