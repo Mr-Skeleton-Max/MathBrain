@@ -2,50 +2,137 @@
 
 **Bounded-State Categorical Voting for Online Sequence Learning**
 
-A white-box, neuroscience-inspired architecture for online sequence prediction with complementary learning systems. MathBrain treats sequence modeling as bounded-state categorical voting driven by explicit memories, not black-box function approximation over growing history.
+No matter how sophisticated a sequence model becomes, the final act of next-token prediction is still a competition among discrete candidates. Even a modern large language model ends in voting. MathBrain takes this observation as a starting point and asks: *what if the entire architecture were designed around voting from the ground up?*
 
-## Key Properties
+The result is a white-box system where memory is not retrieval but **context-triggered re-instantiation of categorical evidence**. The model does not reconstruct continuous history. It preserves just enough bounded evidence for the correct candidate to win the vote. This makes three things possible that are difficult in conventional architectures: **constant-time inference** regardless of sequence length, **continual online learning** without replay buffers, and **full interpretability** where every prediction can be traced to explicit voting evidence.
 
-- **Constant-time inference**: After bounded-state compression, inference time and memory are O(1) with respect to processed sequence length
-- **Continual online learning**: No replay buffer or growing context window required
-- **Fully interpretable**: Every prediction can be traced to specific memory entries and voting evidence
-- **Dual memory system**: Fast short-term memory (B) + slow long-term knowledge (A), inspired by hippocampal-neocortical complementary learning systems
+## The Core Idea
 
-## Architecture Overview
+Consider predicting the next word after *"the cat sat on the"*. A transformer must attend over all previous tokens. MathBrain works differently:
 
 ```
-Token → Hash Retina → Q (EMA state) → φ (distance features)
-                                          ↓
-                              B (sparse short-term memory)
-                              A (low-rank long-term knowledge)
-                                          ↓
-                              Categorical voting → Prediction
+"the cat sat on the"
+
+  1. Hash each word into sparse slot IDs           "the" → {3712, 8891, ...}
+     (deterministic character n-gram hashing)       "cat" → {1204, 5567, ...}
+
+  2. Compress history into bounded EMA state        Q[3712] = [0.95, 0.82, 0.41, 0.12]
+     (4 timescales: fast → slow decay)                        ← recent ──── distant →
+
+  3. Extract positional features φ                  φ[3712] = [0.73, -0.21, ...] ∈ ℝ^D
+     (cosine-chaos map at edge of chaos)            bounded, no explosion
+
+  4. Vote from two memory systems:
+     B (short-term): exact episodic traces          "sat on the → mat"  score: 2.31
+     A (long-term):  generalized structure          "on the → mat"      score: 1.87
+                                                    "on the → floor"    score: 0.42
+  5. Winner: "mat" ✓
+     (every vote is traceable to specific source slots and feature vectors)
 ```
 
-| Component | Role | Analogy |
-|-----------|------|---------|
-| Hash Retina | Deterministic n-gram lexical coding | Sensory encoding |
-| Q State | Multi-timescale EMA compression (N=4 scales) | Temporal context |
-| φ Encoder | Bounded positional feature map (cos+sin chaos) | Distance representation |
-| B Memory | Sparse hash-table voting memory, fast delta-rule write | Hippocampus |
-| A Knowledge | Low-rank slice-wise factorization, slow consolidation | Neocortex |
-| Sleep | Pseudorehearsal transfer from B → A | Memory consolidation |
+The key insight: **voting tolerates compression**. To rank the correct response above competitors, the system needs sufficient evidence, not exact replay. This is why bounded state works.
 
-## Performance
+## Architecture
 
-Early experimental results on TinyStories and PTB:
+```
+                              ┌─────────────────────────────┐
+  Token ──→ Hash Retina ──→   │  Q: Multi-timescale EMA     │ ──→ Active slots
+            (n-gram → slots)  │  4 decay rates: ρ₁..ρ₄     │     + Q values
+                              │  bounded state, O(1) memory │
+                              └──────────────┬──────────────┘
+                                             │
+                              ┌──────────────▼──────────────┐
+                              │  φ: Cosine-Chaos Feature Map │
+                              │  α=2 (edge of chaos)        │
+                              │  L recursive folds → ℝ^D    │
+                              └──────────────┬──────────────┘
+                                             │
+                         ┌───────────────────┼───────────────────┐
+                         │                                       │
+              ┌──────────▼──────────┐             ┌──────────────▼──────────┐
+              │  B: Short-Term      │             │  A: Long-Term           │
+              │  Sparse hash table  │             │  Slice-wise low-rank    │
+              │  Exact episodic     │             │  Generalized structure  │
+              │  traces             │             │  E_src[s], E_tgt[t]     │
+              │  (hippocampus)      │             │  ∈ ℝ^{d×D}             │
+              │                     │             │  (neocortex)            │
+              └──────────┬──────────┘             └──────────────┬──────────┘
+                         │    ℓ_B(t) = Σᵢ ⟨b_{sᵢ,t}, φ̂ᵢ⟩      │
+                         │                                       │
+                         │         ℓ_A(t) = ⟨E_tgt[t], C_A⟩_F   │
+                         └───────────────────┬───────────────────┘
+                                             │
+                              ┌──────────────▼──────────────┐
+                              │  Categorical Vote            │
+                              │  ℓ(t) = ℓ_B(t) + ℓ_A(t)    │
+                              │  Predict: argmax_t ℓ(t)      │
+                              └──────────────────────────────┘
+```
 
-| Setting | Accuracy |
-|---------|----------|
-| Wake-only (B+A) on tinystories_11_20 | 87.0% top-1 |
-| A-only after sleep on tinystories_10 | 84-86% top-1 |
-| A+B combined on tinystories_10 | 92-93% top-1 |
-| First 200 lines of PTB | 85% top-1 |
-| 230-word memorization test | 100% top-1 |
+### Why Two Memories?
+
+This is the core epistemic division:
+
+| | **B** (Short-Term) | **A** (Long-Term) |
+|---|---|---|
+| **What it stores** | Exact co-activation traces | Generalized factored structure |
+| **How it learns** | Online delta-rule, one pass | Offline sleep consolidation |
+| **Generalization** | Weak (memorization) | Strong (pattern extraction) |
+| **Speed** | Instant write | Slow batch optimization |
+| **Biological analog** | Hippocampus | Neocortex |
+
+The most important empirical finding: **A can take over most of B's predictive function.** After sleep consolidation, A-only reaches 84-86% while A+B reaches 92-93%. Sleep is not cosmetic -- it transfers predictive structure into compressed long-term knowledge.
+
+### Wake-Sleep Learning
+
+```
+  ┌─── Wake ────────────────────────────────────────────┐
+  │  Online, one token at a time                        │
+  │  B writes exact traces: Δb = η · gap · φ̂           │
+  │  gap = 1 - (γ·score_A + score_B)                   │
+  │  → self-limiting: stops writing when A+B is enough  │
+  └─────────────────────────┬───────────────────────────┘
+                            │ B accumulates traces
+                            ▼
+  ┌─── Sleep ───────────────────────────────────────────┐
+  │  Offline, batch optimization (AdamW)                │
+  │  Target: y = γ·A_old + B  (blend old knowledge      │
+  │           with new traces)                          │
+  │  Distill exact traces → generalized structure       │
+  │  Optional rehearsal to prevent catastrophic forget   │
+  └─────────────────────────────────────────────────────┘
+```
+
+## How It Differs from Transformers
+
+| | **Transformer** | **MathBrain** |
+|---|---|---|
+| **Inference cost** | O(L) or O(L²) in sequence length | **O(1)** after EMA saturation |
+| **KV cache** | Grows with every token | No cache; bounded EMA state |
+| **Online learning** | Requires full retraining | Native: wake writes are instant |
+| **Interpretability** | Post-hoc attention maps | Every vote is an explicit memory trace |
+| **Memory model** | Implicit in weights | Explicit dual system with inspectable entries |
+| **Training** | Backprop through time | No BPTT; local delta-rule + offline sleep |
+
+The tradeoff: MathBrain's prediction cost scales with vocabulary size O(V) rather than sequence length. It excels at continual, interpretable, bounded-state operation -- not at replacing large-scale language models on broad benchmarks.
+
+## Early Results
+
+| Setting | Accuracy | Note |
+|---------|----------|------|
+| tinystories_10, A+B | 92-93% | Combined dual memory |
+| tinystories_11_20, wake-only | 87.0% | Pure online learning |
+| tinystories_11_20, A-only after sleep | 85.6% | Long-term module alone |
+| tinystories_10, A-only | 84-86% | After 10 wake-sleep cycles |
+| PTB first 200 lines | 85% | Standard benchmark |
+| 230-word memorization test | 100% | Perfect recall |
+| Zero-shot: dog → wolf | positive | Ecological generalization via shared slots |
+
+These are early results on small-scale corpora. The claim is not SOTA on broad benchmarks, but viability of a fundamentally different regime: bounded state, voting-style memory, online learning, and full interpretability.
 
 ## Quick Start
 
-### Installation
+### Install
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/MathBrain.git
@@ -53,13 +140,13 @@ cd MathBrain
 pip install -e .
 ```
 
-### Train on demo data
+### Train
 
 ```bash
 # Single wake-sleep cycle on 10 TinyStories
 python train.py --corpus datasets/tinystories_10.txt --mode cycle --cycles 1
 
-# Multi-cycle training on 20 stories
+# Multi-cycle training
 python train.py --corpus datasets/tinystories_20.txt --mode cycle --cycles 5
 
 # Wake-only (no sleep consolidation)
@@ -74,42 +161,124 @@ from mathbrain import MathBrain, MathBrainConfig
 config = MathBrainConfig()
 model = MathBrain(config)
 
-# Online learning: feed tokens one at a time
+# Online learning: feed tokens one by one
 for token in tokens:
-    prediction = model.forward(token)
+    prediction = model.forward(token)  # learns and predicts simultaneously
 ```
 
 ## Project Structure
 
 ```
 MathBrain/
-├── train.py                 # Training CLI
-├── mathbrain/               # Core package
-│   ├── config.py            # All hyperparameters
-│   ├── model.py             # Main MathBrain class
-│   ├── retina.py            # Hash-based lexical coding
-│   ├── q_state.py           # Multi-timescale EMA state
-│   ├── phi_encoder.py       # Distance feature encoding
-│   ├── phi_encoder_chaos.py # Cosine chaos encoder
-│   ├── b_memory.py          # Short-term B memory variants
-│   ├── a_knowledge_v2.py    # Long-term A knowledge (slice-wise decomposition)
-│   ├── sleep_v2.py          # Wake-sleep consolidation
-│   └── ...
-├── datasets/                # Demo datasets
-├── experiments/             # Reproducible experiments
-├── paper/                   # ArXiv draft
-└── docs/                    # Specification (Chinese)
+├── train.py                     # Training CLI (wake, sleep, cycle modes)
+├── mathbrain/                   # Core package
+│   ├── model.py                 #   Main MathBrain class
+│   ├── config.py                #   All hyperparameters
+│   ├── retina.py                #   Hash-based lexical coding
+│   ├── q_state.py               #   Multi-timescale EMA state
+│   ├── phi_encoder_chaos.py     #   Cosine-chaos feature map
+│   ├── b_memory_hashtable_v2.py #   Short-term sparse memory
+│   ├── a_knowledge_v2.py        #   Long-term slice-wise factorization
+│   ├── sleep_v2.py              #   Wake-sleep consolidation (PyTorch)
+│   ├── sleep_v2_mlx.py          #   Wake-sleep consolidation (MLX)
+│   └── docs/                    #   Detailed architecture docs (Chinese)
+├── datasets/                    # Demo corpora + test sets
+├── experiments/                 # Reproducible experiment scripts
+├── paper/                       # ArXiv draft (.tex + .pdf)
+└── docs/                        # Full mathematical specification (Chinese)
 ```
 
 ## Experiments
 
-The `experiments/` directory contains scripts for reproducing key results:
+The `experiments/` directory contains three lines of investigation beyond the basic wake-sleep loop.
 
-- **`trace_tiny_wake_sleep.py`** — End-to-end wake-sleep demo with accuracy tracing
-- **`run_parallel_wake.py`** — Parallel tree-approximation wake training
-- **`step1_build_dream_data.py`** + **`step2_sleep_onehot.py`** — Dream-sleep pipeline
-- **`exp_sleep_ce.py`** — Cross-entropy sleep training
-- **`step12_two_layer.py`** — Two-layer architecture experiments
+### 1. Tree-Parallel Wake Training
+
+**Script:** `run_parallel_wake.py` | **Insight: O(k log N) training**
+
+Standard wake training processes tokens sequentially -- O(N) in corpus length. But because wake writes are **local edge updates** (each source-target pair is independent), they can be parallelized:
+
+```
+  Corpus: [sent₁, sent₂, ..., sentₙ]
+                    │
+        ┌───────────┼───────────┐
+        ▼           ▼           ▼
+    Shard₁       Shard₂      Shard₃      ← parallel wake on frozen B snapshot
+    (local Δb)   (local Δb)  (local Δb)
+        └───────────┼───────────┘
+                    ▼
+            Tree-merge Δb               ← weighted sum on coincident slot pairs
+                    │
+                    ▼
+              Update B globally
+```
+
+The trainer freezes B at the start of each round, farms out shards in parallel, then tree-merges the sparse delta updates. Per-round cost drops from O(N) to O(k log N) where k = shard size. This is a genuine architectural property of the sparse voting update -- not an approximation hack.
+
+```bash
+# 16 rounds of tree-parallel wake on 20 stories
+python experiments/run_parallel_wake.py \
+    --corpus datasets/tinystories_20.txt --rounds 16 --backend mlx
+
+# Full wake-sleep with parallel wake
+python experiments/run_parallel_wake.py \
+    --corpus datasets/tinystories_10.txt --rounds 16 --cycles 5 --wake-sleep --backend mlx
+```
+
+### 2. Dream Sleep: Can A Learn Without Seeing the Original Text?
+
+**Scripts:** `step1_build_dream_data.py` → `step2_sleep_onehot.py`, `export_dream_dataset.py`, `train_a_from_qdist.py`, `exp_sleep_ce.py`
+
+**Core insight:** Since each voting edge in MathBrain is independent, sleep does not need the original corpus. If we can generate *any* Q-state activations and ask the current A+B system for its top-1 response, that is sufficient supervision for A to learn.
+
+The dream-sleep pipeline:
+1. Generate synthetic Q-state activations (random slot groups driven through EMA, or replay corpus structure)
+2. Query the current A+B teacher for its top-1 prediction at each state (Dirichlet-sharpened one-hot target)
+3. Train A to match these one-hot targets
+
+**Key finding:** What A actually learns during sleep is a **low-rank factorization of B's edge map** -- not a distribution over next tokens. Attempting to fit the full soft distribution (rather than the sharpened top-1) causes catastrophic performance collapse. This reveals that sleep's primary function is **improving B's signal-to-noise ratio** through compression: A captures the dominant pattern, and B only needs to store the residual.
+
+```bash
+# Step 1: wake + export dream dataset (Q-states → teacher scores)
+python experiments/step1_build_dream_data.py
+
+# Step 2: train A from one-hot teacher targets
+python experiments/step2_sleep_onehot.py
+
+# Cross-entropy sleep variant
+python experiments/exp_sleep_ce.py
+```
+
+**Open question:** In theory, B should continue to improve accuracy on top of A (storing what A missed). In practice, the residual B improvement after sleep is currently small. Better designs for the B-on-top-of-A residual path remain an active research direction.
+
+### 3. Multi-Layer MathBrain: From Linear Classifier to MLP
+
+**Scripts:** `step12_two_layer.py`, `step12b_two_layer_fix.py` | **Result: 93% → 97%**
+
+**Motivation:** The current single-layer MathBrain is essentially a **super linear classifier** -- all computation happens in the interaction space between source features and target embeddings. It cannot form abstract intermediate representations. The natural extension: stack layers, like going from a single linear layer to an MLP.
+
+```
+Layer 1: token → Q₁ → φ₁ → B₁ → prediction distribution P₁
+                                        │
+                              top-k winners + actual word (residual connection)
+                                        │
+                                        ▼
+Layer 2: P₁ → Q₂ → φ₂ → B₂ → final prediction
+```
+
+Three variants tested:
+- **Hard attention**: L2 sees only L1's winner prediction
+- **Residual**: L2 sees actual word + L1's winner (best)
+- **Residual + soft**: L2 sees actual word + L1's top-3 softmax
+
+| Variant | Accuracy (tinystories_10) |
+|---------|--------------------------|
+| Single-layer baseline | ~93% |
+| Two-layer, hard attention | ~91% |
+| Two-layer, residual | **~97%** |
+| Two-layer, residual + soft | ~96% |
+
+The residual variant works best: Layer 2 processes the *combination* of what actually happened and what Layer 1 predicted would happen. This is the most promising direction for scaling MathBrain -- each additional layer adds a new level of abstraction while preserving the voting-based, interpretable architecture.
 
 ## Requirements
 
@@ -117,21 +286,21 @@ The `experiments/` directory contains scripts for reproducing key results:
 - NumPy >= 1.21.0
 - SciPy >= 1.7.0
 
-Optional:
-- [MLX](https://github.com/ml-explore/mlx) >= 0.5.0 (Apple Silicon acceleration)
-- [PyTorch](https://pytorch.org/) >= 2.0.0 (GPU acceleration)
+Optional accelerators:
+- [MLX](https://github.com/ml-explore/mlx) >= 0.5.0 (Apple Silicon)
+- [PyTorch](https://pytorch.org/) >= 2.0.0 (CUDA)
 
 ## Citation
 
 ```bibtex
 @article{mathbrain2026,
-  title={Bounded-State Categorical Voting for Online Sequence Learning:
-         A White-Box Alternative to Length-Growing Black-Box Models},
-  author={Anonymous},
-  year={2026}
+  title   = {Bounded-State Categorical Voting for Online Sequence Learning:
+             A White-Box Alternative to Length-Growing Black-Box Models},
+  author  = {Anonymous},
+  year    = {2026}
 }
 ```
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE).
