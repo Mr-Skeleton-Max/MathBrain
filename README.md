@@ -309,6 +309,8 @@ For the full theoretical motivation -- why categorical voting is a viable first 
 
 The paper covers the mathematical formulation in detail, including the complexity analysis, the wake update derivation, the sleep consolidation objective, and the biological correspondence argument. The README gives the intuition; the paper gives the proofs.
 
+For the research journey that led to this architecture -- from BubbleStream to GPT-2 memory analysis to the categorical voting insight to EMA encoding -- see [docs/research_log.md](docs/research_log.md).
+
 ## Requirements
 
 - Python >= 3.8
