@@ -56,3 +56,5 @@ datasets/tinystories_full.txt
 datasets/natural/
 datasets/natural_clean/
 datasets/tinystories/
+
+EXP/
