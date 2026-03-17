@@ -58,3 +58,6 @@ datasets/natural_clean/
 datasets/tinystories/
 
 EXP/
+
+# Conversation exports
+2026-*.txt
