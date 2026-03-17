@@ -143,36 +143,42 @@ cd MathBrain
 pip install -e .
 ```
 
-### Train with MathBrainTrainer (v2, recommended)
+### Train A module (v2, recommended)
+
+```bash
+# Default config (N=4, D=8) on tinystories_10
+python experiments/train_a.py
+
+# Scaled config (N=16, D=32) on tinystories_200
+python experiments/train_a.py --corpus datasets/tinystories_200.txt --N 16 --D 32 --epochs 640
+
+# Save trained model
+python experiments/train_a.py --N 16 --D 32 --epochs 640 --save model.pt
+
+# Sweep N/D configs to find the right scale
+python experiments/train_a.py --corpus datasets/tinystories_200.txt --sweep
+```
+
+Or use the Python API directly:
 
 ```python
 import numpy as np
 from mathbrain import MathBrain, MathBrainConfig
 from mathbrain.trainer import MathBrainTrainer
 
-# Custom config: extend EMA scales for longer context
 config = MathBrainConfig(
-    N=16,                                       # 16 EMA timescales (default 4)
+    N=16,
     RHO=tuple(np.power(0.5, 1.0 / np.geomspace(0.6, 210, 16)).tolist()),
-    D_PHI=32,                                   # phi dimension (default 8)
+    D_PHI=32,
 )
 
 model = MathBrain(config)
 trainer = MathBrainTrainer(model, device='auto')  # auto: cuda > mps > cpu
-
-# Load corpus (list of sentences)
 corpus = open('datasets/tinystories_200.txt').read().strip().split('\n')
 
-# Train
-trainer.fit(corpus, epochs=640, batch_size=128, lr=0.01)
-
-# Evaluate
-result = trainer.evaluate(corpus)
-print(f"Accuracy: {result['accuracy']:.2f}%")
-
-# Save / Load
+trainer.fit(corpus, epochs=640)
+print(trainer.evaluate(corpus))
 trainer.save('model.pt')
-trainer.load('model.pt')
 ```
 
 ### Train with Wake-Sleep (v1, original)
@@ -203,6 +209,7 @@ MathBrain/
 │   └── inference_fast.py        #   Sparse matrix decoder for slot→word
 ├── datasets/                    # Demo corpora
 ├── experiments/                 # Experiment scripts
+│   ├── train_a.py               #   [v2] CLI for A-module training + N/D sweep
 ├── paper/                       # ArXiv draft (.tex + .pdf)
 └── docs/                        # Mathematical specification (Chinese)
 ```
