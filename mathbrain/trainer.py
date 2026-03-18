@@ -61,9 +61,9 @@ class _ChaosEncoder(nn.Module):
         self.phi_mode = phi_mode
         self.learnable_P = learnable_P
 
-        if phi_mode == 'raw':
-            # Raw mode: no P, no chaos. D = N.
-            self.D = N
+        if phi_mode in ('raw', 'precomputed'):
+            # Raw or precomputed: no P, no chaos. D determined by input.
+            self.D = D  # will be overridden by actual input dim
             return
 
         if learnable_P:
@@ -108,8 +108,9 @@ class _ChaosEncoder(nn.Module):
 
     def forward(self, q_scaled):
         """q_scaled: (B, M, N) → phi: (B, M, D), normalized."""
-        if self.phi_mode == 'raw':
-            # Just normalize
+        if self.phi_mode in ('raw', 'precomputed'):
+            # Raw or precomputed: just normalize (precomputed is already normalized,
+            # but re-normalizing is a no-op for unit vectors)
             norms = torch.norm(q_scaled, dim=-1, keepdim=True).clamp(min=1e-8)
             return q_scaled / norms
 
@@ -260,6 +261,8 @@ class MathBrainTrainer:
     def _build_positions(self, corpus: List[str]):
         retina = self.model.retina
         positions = []
+        # 固定 P 时预计算 phi，不进 autograd 图 → backward 快 ~2x
+        precompute = not self.learnable_P
 
         for sentence in corpus:
             words = WakeDataset._tokenize(sentence)
@@ -274,15 +277,22 @@ class MathBrainTrainer:
                 if len(active_slots) == 0:
                     continue
 
-                # 始终存 raw Q（归一化后的 alpha_scale * Q）
-                # CosineChaos 在 forward 里用 PyTorch 计算（如果需要）
                 alpha_scale = self.model.phi_encoder.alpha_scale
                 q_scaled = (Q_vals * alpha_scale).astype(np.float32)
 
+                if precompute and self.phi_mode == 'chaos':
+                    phi = self.model.phi_encoder.encode(Q_vals)
+                    norms = np.linalg.norm(phi, axis=1, keepdims=True)
+                    feature = (phi / (norms + 1e-8)).astype(np.float32)
+                elif precompute and self.phi_mode == 'raw':
+                    norms = np.linalg.norm(q_scaled, axis=1, keepdims=True)
+                    feature = (q_scaled / (norms + 1e-8)).astype(np.float32)
+                else:
+                    feature = q_scaled  # learnable P: raw Q
+
                 gold_word = words[i + 1]
                 gold_slots = np.fromiter(encoded[i + 1].keys(), dtype=np.int32)
-
-                positions.append((active_slots.copy(), q_scaled.copy(),
+                positions.append((active_slots.copy(), feature.copy(),
                                   gold_slots, gold_word))
 
         return positions
@@ -320,11 +330,11 @@ class MathBrainTrainer:
 
         # pad positions
         n_pos = len(positions)
-        N_dim = positions[0][1].shape[1]  # q_scaled 维度 = N
+        feat_dim = positions[0][1].shape[1]  # D (chaos precomputed) or N (raw/learnable)
         max_active = max(len(p[0]) for p in positions)
 
         active_local = np.zeros((n_pos, max_active), dtype=np.int64)
-        q_padded = np.zeros((n_pos, max_active, N_dim), dtype=np.float32)
+        q_padded = np.zeros((n_pos, max_active, feat_dim), dtype=np.float32)
         active_mask = np.zeros((n_pos, max_active), dtype=np.float32)
         teacher_labels = np.zeros(n_pos, dtype=np.int64)
 
@@ -344,7 +354,7 @@ class MathBrainTrainer:
             'q_padded': torch.from_numpy(q_padded),
             'active_mask': torch.from_numpy(active_mask),
             'one_hot': torch.from_numpy(one_hot),
-            'S': S, 'V': V, 'N_dim': N_dim, 'n_pos': n_pos,
+            'S': S, 'V': V, 'feat_dim': feat_dim, 'n_pos': n_pos,
         }
 
     # ------------------------------------------------------------------
@@ -367,12 +377,19 @@ class MathBrainTrainer:
         positions = self._build_positions(corpus)
         data = self._build_tensors(positions)
         n_pos = data['n_pos']
-        S, V, N_dim = data['S'], data['V'], data['N_dim']
+        S, V, feat_dim = data['S'], data['V'], data['feat_dim']
         d_rank = int(self.config.CP_RANK)
         D = int(self.config.D_PHI)
+        N_ema = int(self.config.N)
+        precomputed = not self.learnable_P
+
+        # 当预计算 phi 时，forward 里跳过 ChaosEncoder
+        # feat_dim = D (chaos) 或 N (raw) — 已经是最终特征
+        # 当 learnable P 时，feat_dim = N — forward 里需要 ChaosEncoder
+        phi_mode_eff = 'precomputed' if precomputed else self.phi_mode
 
         print(f"  positions={n_pos}, slots={S}, vocab={V}, "
-              f"d_rank={d_rank}, N={N_dim}, D={D}, device={self.device}, "
+              f"d_rank={d_rank}, feat_dim={feat_dim}, device={self.device}, "
               f"predictor={self.predictor}, phi_mode={self.phi_mode}, "
               f"learnable_P={self.learnable_P}")
 
@@ -384,14 +401,16 @@ class MathBrainTrainer:
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
-        # 获取 P 初始化（从 numpy encoder）
         P_init = self.model.phi_encoder.P  # (D, N) numpy or None
 
         # 模型
+        # D_eff: 特征维度。预计算时 = feat_dim，learnable P 时由 ChaosEncoder 决定
+        D_for_encoder = feat_dim if precomputed else D
+
         if self.predictor == 'transformer':
             net = _SleepModuleTransformer(
-                S, N_dim, D, V, word_proj_t,
-                phi_mode=self.phi_mode,
+                S, N_ema, D_for_encoder, V, word_proj_t,
+                phi_mode=phi_mode_eff,
                 learnable_P=self.learnable_P,
                 P_init=P_init,
                 n_folds=self.config.CHAOS_N_FOLDS,
@@ -402,8 +421,8 @@ class MathBrainTrainer:
             ).to(self.device)
         else:
             net = _SleepModule(
-                S, d_rank, D, N_dim, word_proj_t,
-                phi_mode=self.phi_mode,
+                S, d_rank, D_for_encoder, N_ema, word_proj_t,
+                phi_mode=phi_mode_eff,
                 learnable_P=self.learnable_P,
                 P_init=P_init,
                 n_folds=self.config.CHAOS_N_FOLDS,
@@ -425,6 +444,10 @@ class MathBrainTrainer:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_steps, eta_min=0)
 
+        # AMP (CUDA only)
+        use_amp = self.device.type == 'cuda'
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
         best_loss = float('inf')
         best_state = None
 
@@ -437,13 +460,15 @@ class MathBrainTrainer:
                 e_idx = min(s_idx + batch_size, n_pos)
                 idx = perm[s_idx:e_idx]
 
-                loss = compiled_forward(
-                    active_local[idx], q_padded[idx],
-                    active_mask[idx], one_hot[idx])
-
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    loss = compiled_forward(
+                        active_local[idx], q_padded[idx],
+                        active_mask[idx], one_hot[idx])
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
 
                 epoch_loss += loss.item()
@@ -502,6 +527,7 @@ class MathBrainTrainer:
         s2c = self._slot_to_compact
         vocab_list = self._vocab_list
         alpha_scale = self.model.phi_encoder.alpha_scale
+        precomputed = not self.learnable_P
         correct = total = 0
 
         for sentence in corpus:
@@ -516,8 +542,17 @@ class MathBrainTrainer:
                 if len(active_slots) == 0:
                     continue
 
-                # Raw scaled Q (same as training)
+                # 计算特征（和 _build_positions 一致）
                 q_scaled = (Q_vals * alpha_scale).astype(np.float32)
+                if precomputed and self.phi_mode == 'chaos':
+                    phi_np = self.model.phi_encoder.encode(Q_vals)
+                    norms = np.linalg.norm(phi_np, axis=1, keepdims=True)
+                    feature = (phi_np / (norms + 1e-8)).astype(np.float32)
+                elif precomputed and self.phi_mode == 'raw':
+                    norms = np.linalg.norm(q_scaled, axis=1, keepdims=True)
+                    feature = (q_scaled / (norms + 1e-8)).astype(np.float32)
+                else:
+                    feature = q_scaled
 
                 local_ids = [s2c[int(s)] for s in active_slots if int(s) in s2c]
                 n_valid = len(local_ids)
@@ -525,14 +560,11 @@ class MathBrainTrainer:
                     continue
 
                 b_active = torch.tensor([local_ids], dtype=torch.long, device=self.device)
-                b_q = torch.tensor(q_scaled[:n_valid][None], dtype=torch.float32,
-                                   device=self.device)
+                b_feat = torch.tensor(feature[:n_valid][None], dtype=torch.float32,
+                                      device=self.device)
                 b_mask = torch.ones(1, n_valid, dtype=torch.float32, device=self.device)
 
-                # Forward through net (ChaosEncoder + predictor + word_proj)
-                # Use a dummy target to call forward, then extract logits
-                # Or directly compute logits:
-                phi = net.chaos(b_q)  # (1, n_valid, D_eff)
+                phi = net.chaos(b_feat)  # passthrough for precomputed
 
                 if self.predictor == 'transformer':
                     tok = net.slot_emb(b_active) + net.phi_proj(phi)
