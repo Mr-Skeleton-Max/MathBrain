@@ -453,9 +453,10 @@ class MathBrainTrainer:
                 alpha=self.config.CHAOS_ALPHA,
             ).to(self.device)
 
-        # 尝试 torch.compile（CUDA 有效，MPS/CPU 可能 fallback）
+        # 尝试 torch.compile + TF32（CUDA 有效）
         compiled_forward = net
         if self.device.type == 'cuda':
+            torch.set_float32_matmul_precision('high')  # TF32 for matmul
             try:
                 compiled_forward = torch.compile(net)
             except Exception:
