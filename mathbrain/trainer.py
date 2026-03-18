@@ -152,7 +152,7 @@ class _SleepModule(nn.Module):
 
         self.D = D_eff
         self.S = S
-        self.E_src = nn.Embedding(S, d_rank * D_eff, sparse=True)
+        self.E_src = nn.Embedding(S, d_rank * D_eff)
         nn.init.normal_(self.E_src.weight, std=0.01)
         # E_tgt stored flat: (S, d*D) — no reshape needed in forward
         self.E_tgt = nn.Parameter(torch.randn(S, d_rank * D_eff) * 0.01)
@@ -461,36 +461,16 @@ class MathBrainTrainer:
             except Exception:
                 pass
 
-        # 优化器 — E_src (sparse Embedding) 和其余 (dense) 分开
-        sparse_params = []
-        dense_params = []
-        has_sparse_emb = False
-        for name, module in net.named_modules():
-            if isinstance(module, nn.Embedding) and module.sparse:
-                has_sparse_emb = True
-                sparse_params.extend(module.parameters())
-
-        seen_sparse = set(id(p) for p in sparse_params)
-        for p in net.parameters():
-            if p.requires_grad and id(p) not in seen_sparse:
-                dense_params.append(p)
-
-        if has_sparse_emb and sparse_params:
-            opt_sparse = torch.optim.SparseAdam(sparse_params, lr=lr)
-            opt_dense = torch.optim.AdamW(dense_params, lr=lr, weight_decay=weight_decay)
-            optimizers = [opt_sparse, opt_dense]
-        else:
-            optimizers = [torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)]
+        # 优化器
+        optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
         n_batches = max(1, (n_pos + batch_size - 1) // batch_size)
         total_steps = epochs * n_batches
-        schedulers = [
-            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps, eta_min=0)
-            for opt in optimizers
-        ]
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=0)
 
-        # AMP (CUDA only, and not with sparse embeddings — scaler doesn't support sparse grads)
-        use_amp = self.device.type == 'cuda' and not has_sparse_emb
+        # AMP (CUDA only)
+        use_amp = self.device.type == 'cuda'
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
         best_loss = float('inf')
@@ -505,19 +485,16 @@ class MathBrainTrainer:
                 e_idx = min(s_idx + batch_size, n_pos)
                 idx = perm[s_idx:e_idx]
 
-                for opt in optimizers:
-                    opt.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast('cuda', enabled=use_amp):
                     loss = compiled_forward(
                         active_local[idx], q_padded[idx],
                         active_mask[idx], one_hot[idx])
 
                 scaler.scale(loss).backward()
-                for opt in optimizers:
-                    scaler.step(opt)
+                scaler.step(optimizer)
                 scaler.update()
-                for sched in schedulers:
-                    sched.step()
+                scheduler.step()
 
                 epoch_loss += loss.item()
 
