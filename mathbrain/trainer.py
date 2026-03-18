@@ -135,6 +135,8 @@ class _SleepModule(nn.Module):
     """Bilinear low-rank predictor with integrated CosineChaos.
 
     q_scaled → ChaosEncoder → φ → E_src ⊙ φ → ctx → E_tgt → slot_scores → word_proj → CE
+
+    E_src uses nn.Embedding for efficient sparse backward (avoids scatter_add).
     """
 
     def __init__(self, S, d_rank, D, N, word_proj_t, phi_mode='chaos',
@@ -146,21 +148,25 @@ class _SleepModule(nn.Module):
             N, D, n_folds=n_folds, alpha=alpha,
             phi_mode=phi_mode, learnable_P=learnable_P, P_init=P_init,
         )
-        D_eff = self.chaos.D  # D for chaos, N for raw
+        D_eff = self.chaos.D
 
         self.D = D_eff
-        self.E_src = nn.Parameter(torch.randn(S, d_rank, D_eff) * 0.01)
+        # E_src as Embedding: sparse backward avoids full scatter_add
+        self.E_src = nn.Embedding(S, d_rank * D_eff, sparse=True)
+        nn.init.normal_(self.E_src.weight, std=0.01)
         self.E_tgt = nn.Parameter(torch.randn(S, d_rank, D_eff) * 0.01)
         self.register_buffer('word_proj_t', word_proj_t)
 
     def forward(self, b_active, b_q, b_mask, b_target):
-        # b_q: (B, M, N) raw scaled Q
         phi = self.chaos(b_q)  # (B, M, D_eff)
 
-        src_emb = self.E_src[b_active]  # (B, M, d, D_eff)
+        B_size, M, _ = phi.shape
+        # E_src lookup → reshape to (B, M, d_rank, D_eff)
+        src_flat = self.E_src(b_active)  # (B, M, d_rank*D_eff)
+        src_emb = src_flat.view(B_size, M, self.d_rank, self.D)
+
         weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, phi, b_mask)
 
-        B_size = weighted.shape[0]
         ctx_flat = weighted.reshape(B_size, -1)  # (B, d*D_eff)
 
         E_tgt_flat = self.E_tgt.reshape(-1, self.d_rank * self.D)  # (S, d*D_eff)
@@ -437,15 +443,36 @@ class MathBrainTrainer:
             except Exception:
                 pass
 
-        # 优化器
-        optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+        # 优化器 — E_src (sparse Embedding) 和其余 (dense) 分开
+        sparse_params = []
+        dense_params = []
+        has_sparse_emb = False
+        for name, module in net.named_modules():
+            if isinstance(module, nn.Embedding) and module.sparse:
+                has_sparse_emb = True
+                sparse_params.extend(module.parameters())
+
+        seen_sparse = set(id(p) for p in sparse_params)
+        for p in net.parameters():
+            if p.requires_grad and id(p) not in seen_sparse:
+                dense_params.append(p)
+
+        if has_sparse_emb and sparse_params:
+            opt_sparse = torch.optim.SparseAdam(sparse_params, lr=lr)
+            opt_dense = torch.optim.AdamW(dense_params, lr=lr, weight_decay=weight_decay)
+            optimizers = [opt_sparse, opt_dense]
+        else:
+            optimizers = [torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)]
+
         n_batches = max(1, (n_pos + batch_size - 1) // batch_size)
         total_steps = epochs * n_batches
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=0)
+        schedulers = [
+            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps, eta_min=0)
+            for opt in optimizers
+        ]
 
-        # AMP (CUDA only)
-        use_amp = self.device.type == 'cuda'
+        # AMP (CUDA only, and not with sparse embeddings — scaler doesn't support sparse grads)
+        use_amp = self.device.type == 'cuda' and not has_sparse_emb
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
         best_loss = float('inf')
@@ -460,16 +487,19 @@ class MathBrainTrainer:
                 e_idx = min(s_idx + batch_size, n_pos)
                 idx = perm[s_idx:e_idx]
 
-                optimizer.zero_grad(set_to_none=True)
+                for opt in optimizers:
+                    opt.zero_grad(set_to_none=True)
                 with torch.amp.autocast('cuda', enabled=use_amp):
                     loss = compiled_forward(
                         active_local[idx], q_padded[idx],
                         active_mask[idx], one_hot[idx])
 
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
+                for opt in optimizers:
+                    scaler.step(opt)
                 scaler.update()
-                scheduler.step()
+                for sched in schedulers:
+                    sched.step()
 
                 epoch_loss += loss.item()
 
@@ -573,7 +603,8 @@ class MathBrainTrainer:
                     slot_logits = net.slot_head(out)
                     slot_scores = slot_logits.sum(dim=1) / n_valid
                 else:
-                    src_emb = net.E_src[b_active]  # (1, n_valid, d, D_eff)
+                    src_flat = net.E_src(b_active)  # (1, n_valid, d_rank*D_eff)
+                    src_emb = src_flat.view(1, n_valid, net.d_rank, net.D)
                     weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, phi, b_mask)
                     ctx_flat = weighted.reshape(1, -1)
                     E_tgt_flat = net.E_tgt.reshape(-1, net.d_rank * net.D)
