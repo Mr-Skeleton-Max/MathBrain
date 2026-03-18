@@ -159,31 +159,35 @@ class _SleepModule(nn.Module):
         self.register_buffer('word_proj_t', word_proj_t)
 
     def forward(self, b_active, b_q, b_mask, b_target):
-        phi = self.chaos(b_q)  # (B, M, D_eff)
+        phi = self.chaos(b_q)  # (B, M, D)
 
-        B_size, M, D = phi.shape
+        B, M, D = phi.shape
         d = self.d_rank
 
         # E_src lookup: (B, M, d*D)
         src_flat = self.E_src(b_active)
 
-        # phi * mask → masked phi: (B, M, D)
+        # phi * mask: (B, M, D)
         phi_masked = phi * b_mask.unsqueeze(-1)
 
-        # 手动展开 einsum 'bmrd,bmd->brd':
-        # src_flat is (B, M, d*D), view as (B*d, M, D) 不行因为 d*D 是交错的
-        # src_flat[b,m,:] = [r0d0, r0d1, ..., r0d_{D-1}, r1d0, ...]
-        # 需要 view(B, M, d, D) 然后 permute
+        # 手动 bmm 替代 einsum，避免 reshape 触发 clone:
+        # 目标: ctx[b,r,d] = Σ_m src[b,m,r,d] * phi_masked[b,m,d]
+        #
+        # 重排为 bmm:
+        #   src_flat: (B, M, d*D) → (B*D, M, d) via permute
+        #   phi_masked: (B, M, D) → (B*D, M, 1)
+        #   bmm → (B*D, d, 1) → (B, D, d) → (B, d*D)
+        #
+        # 但这需要 permute 和 contiguous，同样有 copy 开销。
+        #
+        # 更好的方案: 把 einsum 拆成 element-wise mul + sum
+        # src_4d: (B, M, d, D) * phi_masked: (B, M, 1, D) → (B, M, d, D) → sum(dim=1) → (B, d, D)
+        src_4d = src_flat.view(B, M, d, D)
+        # 用 mul + sum 替代 einsum（PyTorch 对这个模式有更好的 fusion）
+        weighted = (src_4d * phi_masked.unsqueeze(2)).sum(dim=1)  # (B, d, D)
 
-        # 用 einsum 但避免多余 reshape:
-        # src: (B, M, d*D) → (B, M, d, D)
-        src_4d = src_flat.view(B_size, M, d, D)
-        # weighted: (B, d, D) = sum_m src_4d[b,m,r,d] * phi_masked[b,m,d]
-        weighted = torch.einsum('bmrd,bmd->brd', src_4d, phi_masked)
+        ctx_flat = weighted.view(B, d * D)  # view 不 copy（weighted 已连续）
 
-        ctx_flat = weighted.reshape(B_size, d * D)  # (B, d*D)
-
-        # E_tgt already flat: (S, d*D)
         slot_scores = ctx_flat @ self.E_tgt.t()  # (B, S)
 
         active_count = b_mask.sum(1, keepdim=True).clamp(min=1.0)
