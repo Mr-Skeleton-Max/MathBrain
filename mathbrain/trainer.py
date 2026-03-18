@@ -151,26 +151,40 @@ class _SleepModule(nn.Module):
         D_eff = self.chaos.D
 
         self.D = D_eff
-        # E_src as Embedding: sparse backward avoids full scatter_add
+        self.S = S
         self.E_src = nn.Embedding(S, d_rank * D_eff, sparse=True)
         nn.init.normal_(self.E_src.weight, std=0.01)
-        self.E_tgt = nn.Parameter(torch.randn(S, d_rank, D_eff) * 0.01)
+        # E_tgt stored flat: (S, d*D) — no reshape needed in forward
+        self.E_tgt = nn.Parameter(torch.randn(S, d_rank * D_eff) * 0.01)
         self.register_buffer('word_proj_t', word_proj_t)
 
     def forward(self, b_active, b_q, b_mask, b_target):
         phi = self.chaos(b_q)  # (B, M, D_eff)
 
-        B_size, M, _ = phi.shape
-        # E_src lookup → reshape to (B, M, d_rank, D_eff)
-        src_flat = self.E_src(b_active)  # (B, M, d_rank*D_eff)
-        src_emb = src_flat.view(B_size, M, self.d_rank, self.D)
+        B_size, M, D = phi.shape
+        d = self.d_rank
 
-        weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, phi, b_mask)
+        # E_src lookup: (B, M, d*D)
+        src_flat = self.E_src(b_active)
 
-        ctx_flat = weighted.reshape(B_size, -1)  # (B, d*D_eff)
+        # phi * mask → masked phi: (B, M, D)
+        phi_masked = phi * b_mask.unsqueeze(-1)
 
-        E_tgt_flat = self.E_tgt.reshape(-1, self.d_rank * self.D)  # (S, d*D_eff)
-        slot_scores = ctx_flat @ E_tgt_flat.t()  # (B, S)
+        # 手动展开 einsum 'bmrd,bmd->brd':
+        # src_flat is (B, M, d*D), view as (B*d, M, D) 不行因为 d*D 是交错的
+        # src_flat[b,m,:] = [r0d0, r0d1, ..., r0d_{D-1}, r1d0, ...]
+        # 需要 view(B, M, d, D) 然后 permute
+
+        # 用 einsum 但避免多余 reshape:
+        # src: (B, M, d*D) → (B, M, d, D)
+        src_4d = src_flat.view(B_size, M, d, D)
+        # weighted: (B, d, D) = sum_m src_4d[b,m,r,d] * phi_masked[b,m,d]
+        weighted = torch.einsum('bmrd,bmd->brd', src_4d, phi_masked)
+
+        ctx_flat = weighted.reshape(B_size, d * D)  # (B, d*D)
+
+        # E_tgt already flat: (S, d*D)
+        slot_scores = ctx_flat @ self.E_tgt.t()  # (B, S)
 
         active_count = b_mask.sum(1, keepdim=True).clamp(min=1.0)
         slot_scores = slot_scores / active_count
@@ -605,10 +619,10 @@ class MathBrainTrainer:
                 else:
                     src_flat = net.E_src(b_active)  # (1, n_valid, d_rank*D_eff)
                     src_emb = src_flat.view(1, n_valid, net.d_rank, net.D)
-                    weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, phi, b_mask)
+                    phi_masked = phi * b_mask.unsqueeze(-1)
+                    weighted = torch.einsum('bmrd,bmd->brd', src_emb, phi_masked)
                     ctx_flat = weighted.reshape(1, -1)
-                    E_tgt_flat = net.E_tgt.reshape(-1, net.d_rank * net.D)
-                    slot_scores = ctx_flat @ E_tgt_flat.t()
+                    slot_scores = ctx_flat @ net.E_tgt.t()
                     slot_scores = slot_scores / n_valid
 
                 word_logits = slot_scores @ net.word_proj_t
