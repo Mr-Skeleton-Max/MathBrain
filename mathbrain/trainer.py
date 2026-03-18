@@ -16,11 +16,13 @@
 from __future__ import annotations
 
 import time
+import math
 from pathlib import Path
 from typing import Dict, List, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import MathBrainConfig
@@ -38,38 +40,192 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-class _SleepModule(torch.nn.Module):
-    """前向传播模块。
+class _ChaosEncoder(nn.Module):
+    """PyTorch CosineChaos encoder with optional learnable P.
 
-    用 (S, d, D) 3D 存储，但用 einsum 避免显式 tile/expand。
+    P = Q_ortho(A) @ diag(exp(log_s))
+    Q_ortho via Cayley transform: Q = (I - A)(I + A)^{-1}, A is skew-symmetric
+
+    Modes:
+      - 'chaos': full CosineChaos with P (fixed or learnable)
+      - 'raw': identity (pass through q_scaled, normalize only)
     """
 
-    def __init__(self, S, d_rank, D, word_proj_t):
+    def __init__(self, N, D, n_folds=3, alpha=2.0, phi_mode='chaos',
+                 learnable_P=False, P_init=None):
+        super().__init__()
+        self.N = N
+        self.D = D
+        self.n_folds = n_folds
+        self.alpha = alpha
+        self.phi_mode = phi_mode
+        self.learnable_P = learnable_P
+
+        if phi_mode == 'raw':
+            # Raw mode: no P, no chaos. D = N.
+            self.D = N
+            return
+
+        if learnable_P:
+            # Cayley parametrization: skew-symmetric A → orthogonal Q
+            self.A_param = nn.Parameter(torch.zeros(D, D) * 0.01)
+            # Learnable log singular values
+            if P_init is not None:
+                _, s_init, _ = torch.linalg.svd(torch.from_numpy(P_init).float())
+                self.log_s = nn.Parameter(torch.log(s_init[:D].clamp(min=0.01)))
+            else:
+                self.log_s = nn.Parameter(torch.zeros(min(D, N)))
+        else:
+            # Fixed P from numpy
+            if P_init is not None:
+                self.register_buffer('P', torch.from_numpy(P_init).float())
+            else:
+                rng = np.random.RandomState(42)
+                P_np = rng.randn(D, N).astype(np.float32) * 0.5
+                self.register_buffer('P', torch.from_numpy(P_np))
+
+    def _get_P(self):
+        """Get P matrix (fixed or from Cayley parametrization)."""
+        if not self.learnable_P:
+            return self.P
+
+        # Cayley: Q = (I - A)(I + A)^{-1} where A is skew-symmetric
+        A = self.A_param - self.A_param.t()  # enforce skew-symmetric
+        I = torch.eye(self.D, device=A.device)
+        Q = torch.linalg.solve(I + A, I - A)  # (D, D) orthogonal
+
+        # Singular values
+        s = torch.exp(self.log_s)  # (min(D,N),)
+
+        # P = Q[:, :N] @ diag(s)  if D >= N
+        # P = Q @ diag(s)[:D, :N] if D < N
+        if self.D >= self.N:
+            P = Q[:, :self.N] * s.unsqueeze(0)  # (D, N)
+        else:
+            P = Q * s[:self.D].unsqueeze(0)  # (D, D) then need to pad
+            # This case shouldn't happen in practice (D >= N for chaos)
+        return P
+
+    def forward(self, q_scaled):
+        """q_scaled: (B, M, N) → phi: (B, M, D), normalized."""
+        if self.phi_mode == 'raw':
+            # Just normalize
+            norms = torch.norm(q_scaled, dim=-1, keepdim=True).clamp(min=1e-8)
+            return q_scaled / norms
+
+        P = self._get_P()  # (D, N)
+
+        # E = q_scaled @ P.T → (B, M, D)
+        E = torch.matmul(q_scaled, P.t())
+
+        # Chaos folding: M_t = cos(α * (shift(M_{t-1}) + E))
+        B, M, D = E.shape
+        state = torch.zeros_like(E)
+        for _ in range(self.n_folds):
+            shifted = torch.roll(state, 1, dims=-1)
+            state = torch.cos(self.alpha * (shifted + E))
+
+        # Normalize
+        norms = torch.norm(state, dim=-1, keepdim=True).clamp(min=1e-8)
+        return state / norms
+
+
+class _SleepModule(nn.Module):
+    """Bilinear low-rank predictor with integrated CosineChaos.
+
+    q_scaled → ChaosEncoder → φ → E_src ⊙ φ → ctx → E_tgt → slot_scores → word_proj → CE
+    """
+
+    def __init__(self, S, d_rank, D, N, word_proj_t, phi_mode='chaos',
+                 learnable_P=False, P_init=None, n_folds=3, alpha=2.0):
         super().__init__()
         self.d_rank = d_rank
-        self.D = D
-        self.E_src = torch.nn.Parameter(torch.randn(S, d_rank, D) * 0.01)
-        self.E_tgt = torch.nn.Parameter(torch.randn(S, d_rank, D) * 0.01)
+
+        self.chaos = _ChaosEncoder(
+            N, D, n_folds=n_folds, alpha=alpha,
+            phi_mode=phi_mode, learnable_P=learnable_P, P_init=P_init,
+        )
+        D_eff = self.chaos.D  # D for chaos, N for raw
+
+        self.D = D_eff
+        self.E_src = nn.Parameter(torch.randn(S, d_rank, D_eff) * 0.01)
+        self.E_tgt = nn.Parameter(torch.randn(S, d_rank, D_eff) * 0.01)
         self.register_buffer('word_proj_t', word_proj_t)
 
-    def forward(self, b_active, b_phi, b_mask, b_target):
-        src_emb = self.E_src[b_active]                            # (B, M, d, D)
-        # einsum: 对 D 维做逐元素乘，对 M 维求和（带 mask）
-        # ctx[b, r, m] = Σ_j src_emb[b,j,r,m] * phi[b,j,m] * mask[b,j]
-        weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, b_phi, b_mask)
-        # weighted: (B, d, D)
+    def forward(self, b_active, b_q, b_mask, b_target):
+        # b_q: (B, M, N) raw scaled Q
+        phi = self.chaos(b_q)  # (B, M, D_eff)
+
+        src_emb = self.E_src[b_active]  # (B, M, d, D_eff)
+        weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, phi, b_mask)
 
         B_size = weighted.shape[0]
-        ctx_flat = weighted.reshape(B_size, -1)                   # (B, d*D)
+        ctx_flat = weighted.reshape(B_size, -1)  # (B, d*D_eff)
 
-        E_tgt_flat = self.E_tgt.reshape(-1, self.d_rank * self.D) # (S, d*D)
-        slot_scores = ctx_flat @ E_tgt_flat.t()                   # (B, S)
+        E_tgt_flat = self.E_tgt.reshape(-1, self.d_rank * self.D)  # (S, d*D_eff)
+        slot_scores = ctx_flat @ E_tgt_flat.t()  # (B, S)
 
         active_count = b_mask.sum(1, keepdim=True).clamp(min=1.0)
         slot_scores = slot_scores / active_count
 
-        word_scores = slot_scores @ self.word_proj_t              # (B, V)
-        loss = F.mse_loss(word_scores, b_target)
+        word_logits = slot_scores @ self.word_proj_t  # (B, V)
+        target_idx = b_target.argmax(dim=1)
+        loss = F.cross_entropy(word_logits, target_idx)
+        return loss
+
+
+class _SleepModuleTransformer(nn.Module):
+    """Transformer-over-slots predictor with integrated CosineChaos.
+
+    q_scaled → ChaosEncoder → φ → slot_emb + phi_proj(φ) → attention → slot_head → word_proj → CE
+    """
+
+    def __init__(self, S, N, D, V, word_proj_t, phi_mode='chaos',
+                 learnable_P=False, P_init=None, n_folds=3, alpha=2.0,
+                 d_model=128, n_heads=4, n_layers=2, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.S = S
+
+        self.chaos = _ChaosEncoder(
+            N, D, n_folds=n_folds, alpha=alpha,
+            phi_mode=phi_mode, learnable_P=learnable_P, P_init=P_init,
+        )
+        D_eff = self.chaos.D
+
+        self.slot_emb = nn.Embedding(S, d_model)
+        self.phi_proj = nn.Linear(D_eff, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True,
+            activation='gelu',
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers,
+        )
+
+        self.slot_head = nn.Linear(d_model, S)
+        self.register_buffer('word_proj_t', word_proj_t)
+
+    def forward(self, b_active, b_q, b_mask, b_target):
+        phi = self.chaos(b_q)  # (B, M, D_eff)
+
+        tok = self.slot_emb(b_active) + self.phi_proj(phi)  # (B, M, d_model)
+        pad_mask = (b_mask == 0)
+
+        out = self.transformer(tok, src_key_padding_mask=pad_mask)
+
+        slot_logits = self.slot_head(out)  # (B, M, S)
+        mask_expanded = b_mask.unsqueeze(-1)
+        slot_scores = (slot_logits * mask_expanded).sum(dim=1)
+        active_count = b_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        slot_scores = slot_scores / active_count
+
+        word_logits = slot_scores @ self.word_proj_t
+        target_idx = b_target.argmax(dim=1)
+        loss = F.cross_entropy(word_logits, target_idx)
         return loss
 
 
@@ -79,10 +235,18 @@ class MathBrainTrainer:
     直接用 gold teacher 做 dream sleep，不需要 B wake。
     """
 
-    def __init__(self, model, device: str = 'auto'):
+    def __init__(self, model, device: str = 'auto', predictor: str = 'linear',
+                 d_model: int = 128, n_heads: int = 4, n_layers: int = 2,
+                 phi_mode: str = 'chaos', learnable_P: bool = False):
         self.model = model
         self.config = model.config
         self.device = _resolve_device(device)
+        self.predictor = predictor
+        self.phi_mode = phi_mode
+        self.learnable_P = learnable_P
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
 
         self._slot_universe = None
         self._slot_to_compact = None
@@ -110,14 +274,15 @@ class MathBrainTrainer:
                 if len(active_slots) == 0:
                     continue
 
-                phi = self.model.phi_encoder.encode(Q_vals)
-                phi_norms = np.linalg.norm(phi, axis=1, keepdims=True)
-                phi_hat = (phi / (phi_norms + 1e-8)).astype(np.float32)
+                # 始终存 raw Q（归一化后的 alpha_scale * Q）
+                # CosineChaos 在 forward 里用 PyTorch 计算（如果需要）
+                alpha_scale = self.model.phi_encoder.alpha_scale
+                q_scaled = (Q_vals * alpha_scale).astype(np.float32)
 
                 gold_word = words[i + 1]
                 gold_slots = np.fromiter(encoded[i + 1].keys(), dtype=np.int32)
 
-                positions.append((active_slots.copy(), phi_hat.copy(),
+                positions.append((active_slots.copy(), q_scaled.copy(),
                                   gold_slots, gold_word))
 
         return positions
@@ -155,19 +320,19 @@ class MathBrainTrainer:
 
         # pad positions
         n_pos = len(positions)
-        D_phi = positions[0][1].shape[1]
+        N_dim = positions[0][1].shape[1]  # q_scaled 维度 = N
         max_active = max(len(p[0]) for p in positions)
 
         active_local = np.zeros((n_pos, max_active), dtype=np.int64)
-        phi_padded = np.zeros((n_pos, max_active, D_phi), dtype=np.float32)
+        q_padded = np.zeros((n_pos, max_active, N_dim), dtype=np.float32)
         active_mask = np.zeros((n_pos, max_active), dtype=np.float32)
         teacher_labels = np.zeros(n_pos, dtype=np.int64)
 
-        for i, (act, phi_h, _, gw) in enumerate(positions):
+        for i, (act, q_sc, _, gw) in enumerate(positions):
             n = len(act)
             local_ids = [self._slot_to_compact[int(s)] for s in act]
             active_local[i, :n] = local_ids
-            phi_padded[i, :n] = phi_h
+            q_padded[i, :n] = q_sc
             active_mask[i, :n] = 1.0
             teacher_labels[i] = word_to_idx.get(gw, 0)
 
@@ -176,10 +341,10 @@ class MathBrainTrainer:
 
         return {
             'active_local': torch.from_numpy(active_local),
-            'phi_padded': torch.from_numpy(phi_padded),
+            'q_padded': torch.from_numpy(q_padded),
             'active_mask': torch.from_numpy(active_mask),
             'one_hot': torch.from_numpy(one_hot),
-            'S': S, 'V': V, 'D_phi': D_phi, 'n_pos': n_pos,
+            'S': S, 'V': V, 'N_dim': N_dim, 'n_pos': n_pos,
         }
 
     # ------------------------------------------------------------------
@@ -202,22 +367,48 @@ class MathBrainTrainer:
         positions = self._build_positions(corpus)
         data = self._build_tensors(positions)
         n_pos = data['n_pos']
-        S, V, D_phi = data['S'], data['V'], data['D_phi']
+        S, V, N_dim = data['S'], data['V'], data['N_dim']
         d_rank = int(self.config.CP_RANK)
+        D = int(self.config.D_PHI)
 
         print(f"  positions={n_pos}, slots={S}, vocab={V}, "
-              f"d_rank={d_rank}, D={D_phi}, device={self.device}")
+              f"d_rank={d_rank}, N={N_dim}, D={D}, device={self.device}, "
+              f"predictor={self.predictor}, phi_mode={self.phi_mode}, "
+              f"learnable_P={self.learnable_P}")
 
         # 数据 → device
         active_local = data['active_local'].to(self.device)
-        phi_padded = data['phi_padded'].to(self.device)
+        q_padded = data['q_padded'].to(self.device)
         active_mask = data['active_mask'].to(self.device)
         one_hot = data['one_hot'].to(self.device)
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
+        # 获取 P 初始化（从 numpy encoder）
+        P_init = self.model.phi_encoder.P  # (D, N) numpy or None
+
         # 模型
-        net = _SleepModule(S, d_rank, D_phi, word_proj_t).to(self.device)
+        if self.predictor == 'transformer':
+            net = _SleepModuleTransformer(
+                S, N_dim, D, V, word_proj_t,
+                phi_mode=self.phi_mode,
+                learnable_P=self.learnable_P,
+                P_init=P_init,
+                n_folds=self.config.CHAOS_N_FOLDS,
+                alpha=self.config.CHAOS_ALPHA,
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                n_layers=self.n_layers,
+            ).to(self.device)
+        else:
+            net = _SleepModule(
+                S, d_rank, D, N_dim, word_proj_t,
+                phi_mode=self.phi_mode,
+                learnable_P=self.learnable_P,
+                P_init=P_init,
+                n_folds=self.config.CHAOS_N_FOLDS,
+                alpha=self.config.CHAOS_ALPHA,
+            ).to(self.device)
 
         # 尝试 torch.compile（CUDA 有效，MPS/CPU 可能 fallback）
         compiled_forward = net
@@ -247,7 +438,7 @@ class MathBrainTrainer:
                 idx = perm[s_idx:e_idx]
 
                 loss = compiled_forward(
-                    active_local[idx], phi_padded[idx],
+                    active_local[idx], q_padded[idx],
                     active_mask[idx], one_hot[idx])
 
                 optimizer.zero_grad(set_to_none=True)
@@ -262,14 +453,15 @@ class MathBrainTrainer:
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 best_state = {k: v.detach().cpu().clone()
-                              for k, v in net.state_dict().items()
-                              if k in ('E_src', 'E_tgt')}
+                              for k, v in net.state_dict().items()}
 
             if epoch % log_interval == 0 or epoch == epochs - 1:
                 print(f"      epoch {epoch:4d}: loss={epoch_loss:.6f}")
 
-        # 写回
-        self._write_back(best_state['E_src'].numpy(), best_state['E_tgt'].numpy())
+        # 写回 — 保留完整 net 用于 evaluate
+        net.load_state_dict(best_state)
+        self._trained_net = net
+        self._trained_net.eval()
 
         elapsed = time.time() - t0
         print(f"  训练完成: best_loss={best_loss:.6f}, elapsed={elapsed:.1f}s")
@@ -292,10 +484,24 @@ class MathBrainTrainer:
     # evaluate
     # ------------------------------------------------------------------
 
+    def _compute_phi(self, Q_vals):
+        """Compute phi from Q_vals, respecting phi_mode setting."""
+        if self.phi_mode == 'raw':
+            alpha_scale = self.model.phi_encoder.alpha_scale
+            phi = Q_vals * alpha_scale  # (n, N)
+        else:
+            phi = self.model.phi_encoder.encode(Q_vals)  # (n, D)
+        phi_norms = np.linalg.norm(phi, axis=1, keepdims=True)
+        return (phi / (phi_norms + 1e-8)).astype(np.float32)
+
+    @torch.no_grad()
     def evaluate(self, corpus: List[str]) -> Dict[str, float]:
-        decoder = SparseMatrixDecoder(
-            self.model.vocab, self.model.word_to_slots, self.config.K)
+        net = self._trained_net
+        net.eval()
         retina = self.model.retina
+        s2c = self._slot_to_compact
+        vocab_list = self._vocab_list
+        alpha_scale = self.model.phi_encoder.alpha_scale
         correct = total = 0
 
         for sentence in corpus:
@@ -309,13 +515,45 @@ class MathBrainTrainer:
                 active_slots, Q_vals = self.model.q.get_active()
                 if len(active_slots) == 0:
                     continue
-                phi = self.model.phi_encoder.encode(Q_vals)
-                phi_norms = np.linalg.norm(phi, axis=1, keepdims=True)
-                phi_hat = (phi / (phi_norms + 1e-8)).astype(np.float32)
-                scores = self.model.a.predict(active_slots, phi_hat)
-                pred = decoder.decode_top_k(scores, 1)[0][0]
+
+                # Raw scaled Q (same as training)
+                q_scaled = (Q_vals * alpha_scale).astype(np.float32)
+
+                local_ids = [s2c[int(s)] for s in active_slots if int(s) in s2c]
+                n_valid = len(local_ids)
+                if n_valid == 0:
+                    continue
+
+                b_active = torch.tensor([local_ids], dtype=torch.long, device=self.device)
+                b_q = torch.tensor(q_scaled[:n_valid][None], dtype=torch.float32,
+                                   device=self.device)
+                b_mask = torch.ones(1, n_valid, dtype=torch.float32, device=self.device)
+
+                # Forward through net (ChaosEncoder + predictor + word_proj)
+                # Use a dummy target to call forward, then extract logits
+                # Or directly compute logits:
+                phi = net.chaos(b_q)  # (1, n_valid, D_eff)
+
+                if self.predictor == 'transformer':
+                    tok = net.slot_emb(b_active) + net.phi_proj(phi)
+                    pad_mask = torch.zeros(1, n_valid, dtype=torch.bool, device=self.device)
+                    out = net.transformer(tok, src_key_padding_mask=pad_mask)
+                    slot_logits = net.slot_head(out)
+                    slot_scores = slot_logits.sum(dim=1) / n_valid
+                else:
+                    src_emb = net.E_src[b_active]  # (1, n_valid, d, D_eff)
+                    weighted = torch.einsum('bmrd,bmd,bm->brd', src_emb, phi, b_mask)
+                    ctx_flat = weighted.reshape(1, -1)
+                    E_tgt_flat = net.E_tgt.reshape(-1, net.d_rank * net.D)
+                    slot_scores = ctx_flat @ E_tgt_flat.t()
+                    slot_scores = slot_scores / n_valid
+
+                word_logits = slot_scores @ net.word_proj_t
+                pred_idx = word_logits.argmax(dim=1).item()
+
+                pred_word = vocab_list[pred_idx] if pred_idx < len(vocab_list) else ''
                 total += 1
-                if pred == words[i + 1]:
+                if pred_word == words[i + 1]:
                     correct += 1
 
         acc = correct / total * 100 if total > 0 else 0.0

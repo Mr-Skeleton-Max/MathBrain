@@ -61,19 +61,25 @@ def print_rho(rho):
 
 
 def run_single(corpus, rho, D, cp_rank, epochs, batch_size, device,
-               save_path=None, log_interval=20):
+               save_path=None, log_interval=20,
+               predictor='linear', d_model=128, n_heads=4, n_layers=2,
+               phi_mode='chaos', learnable_P=False):
     N = len(rho)
     hl = np.log(0.5) / np.log(np.array(rho))
 
     print(f"\n{'='*60}")
-    print(f"N={N}, D={D}, CP_RANK={cp_rank}, epochs={epochs}")
-    print(f"  max half-life={hl[-1]:.0f}")
+    print(f"N={N}, D={D}, CP_RANK={cp_rank}, epochs={epochs}, predictor={predictor}")
+    print(f"  max half-life={hl[-1]:.0f}, phi_mode={phi_mode}")
+    if predictor == 'transformer':
+        print(f"  d_model={d_model}, n_heads={n_heads}, n_layers={n_layers}")
     print_rho(rho)
     print(f"{'='*60}")
 
     cfg = MathBrainConfig(N=N, RHO=tuple(rho), D_PHI=D, CP_RANK=cp_rank)
     model = MathBrain(cfg)
-    trainer = MathBrainTrainer(model, device=device)
+    trainer = MathBrainTrainer(model, device=device, predictor=predictor,
+                               d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+                               phi_mode=phi_mode, learnable_P=learnable_P)
 
     result = trainer.fit(corpus, epochs=epochs, batch_size=batch_size,
                          log_interval=log_interval)
@@ -85,7 +91,7 @@ def run_single(corpus, rho, D, cp_rank, epochs, batch_size, device,
         trainer.save(save_path)
 
     return {'N': N, 'D': D, 'cp_rank': cp_rank, 'epochs': epochs,
-            'max_hl': hl[-1], **result, **eval_result}
+            'max_hl': hl[-1], 'predictor': predictor, **result, **eval_result}
 
 
 def main():
@@ -110,6 +116,21 @@ def main():
                         help='Save trained model to file')
     parser.add_argument('--sweep', action='store_true',
                         help='Sweep N/D configs: (4,8), (8,16), (12,24), (16,32)')
+    # Predictor options
+    parser.add_argument('--predictor', default='linear',
+                        choices=['linear', 'transformer'],
+                        help='Predictor type (default: linear)')
+    parser.add_argument('--d-model', type=int, default=128,
+                        help='Transformer d_model (default: 128)')
+    parser.add_argument('--n-heads', type=int, default=4,
+                        help='Transformer attention heads (default: 4)')
+    parser.add_argument('--n-layers', type=int, default=2,
+                        help='Transformer encoder layers (default: 2)')
+    parser.add_argument('--phi-mode', default='chaos',
+                        choices=['chaos', 'raw'],
+                        help='Phi encoding: chaos (CosineChaos) or raw (alpha_scale*Q)')
+    parser.add_argument('--learnable-P', action='store_true',
+                        help='Make P matrix learnable (Cayley parametrization)')
     args = parser.parse_args()
 
     corpus = load_corpus(args.corpus)
@@ -147,7 +168,13 @@ def main():
         D = args.D or (2 * N)
         run_single(corpus, rho, D, args.cp_rank, args.epochs,
                    args.batch_size, args.device, args.save,
-                   log_interval=args.log_interval)
+                   log_interval=args.log_interval,
+                   predictor=args.predictor,
+                   d_model=args.d_model,
+                   n_heads=args.n_heads,
+                   n_layers=args.n_layers,
+                   phi_mode=args.phi_mode,
+                   learnable_P=args.learnable_P)
 
 
 if __name__ == '__main__':
