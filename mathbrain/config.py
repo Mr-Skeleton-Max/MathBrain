@@ -23,6 +23,7 @@ class MathBrainConfig:
     # Cosine Chaos 编码器参数 (chaos 模式)
     CHAOS_N_FOLDS: int = 3       # 折叠次数 L (推荐 1-3)
     CHAOS_ALPHA: float = 2.0     # 混沌参数 α (2.0 为临界点)
+    CHAOS_NO_P: bool = False     # True: 去掉 P 投影，D=N, L=N, α=α*(N)
 
     # 确定性傅里叶特征 (Deterministic Fourier Features)
     # D_COSINE = d = F_ALPHA * N * 2 (cos + sin)
@@ -122,6 +123,8 @@ class MathBrainConfig:
         if self.PHI_MODE == "fourier":
             self.d = self.D_COSINE
         elif self.PHI_MODE in ("random", "chaos"):
+            if self.CHAOS_NO_P:
+                self.D_PHI = self.N  # 无 P 模式: D = N
             self.d = self.D_PHI
         else:
             raise ValueError(f"Unknown PHI_MODE: {self.PHI_MODE}")

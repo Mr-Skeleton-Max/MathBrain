@@ -117,6 +117,7 @@ def create_phi_encoder(config: MathBrainConfig = None):
         return PhiEncoderCosineChaos(
             cfg, D=cfg.D_PHI,
             n_folds=cfg.CHAOS_N_FOLDS,
-            alpha=cfg.CHAOS_ALPHA)
+            alpha=cfg.CHAOS_ALPHA,
+            no_P=cfg.CHAOS_NO_P)
     else:
         raise ValueError(f"Unknown PHI_MODE: {cfg.PHI_MODE}")

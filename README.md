@@ -8,11 +8,10 @@ MathBrain is an experimental sequence prediction architecture that does not stor
 
 ## Key Ideas
 
-- **Prediction is voting.** Every next-token prediction is a categorical competition. The architecture is designed around this from the ground up.
-- **History should be compressed, not stored.** Multi-timescale EMA states capture "when did I last see this pattern" without keeping the full sequence.
-- **Voting tolerates compression.** You don't need exact replay to rank the correct candidate above competitors -- sufficient evidence is enough.
-- **Low-rank factorization is implicit abstraction.** The CP_RANK-dimensional intermediate space in A's prediction (`E_src → virtual space → E_tgt`) acts as a hidden layer -- each source slot projects through a learned abstract space before voting on targets.
-- **Width over depth.** Extending EMA timescales (N) and feature dimensions (D) is more effective than stacking layers. Single-layer MathBrain with sufficient width reaches 97-99% on test corpora.
+- **Sequence context can be rotated from "temporal horizontal" to "model vertical".** Instead of attending over token history (O(N)), MathBrain compresses context into per-slot EMA states -- turning temporal information into bounded feature vectors. This encoding is orthogonal to the downstream predictor and compatible with any model architecture.
+- **Per-slot independence is critical.** Each slot maintains its own EMA state independently. Summing across slots would collapse the architecture. Independent slots enable independent voting, which tolerates compression noise.
+- **Nonlinear feature expansion at edge of chaos.** Raw EMA states have very low discriminability. Cosine-chaos folding amplifies micro-differences between contexts into distinguishable features, while remaining bounded. The Lyapunov exponent controls the tradeoff between amplification and stability.
+- **The predictor is a modular component.** The current bilinear low-rank voter (E_src, E_tgt) is one choice. It could be replaced by any classifier -- MLP, Transformer, etc. The encoding is the core contribution, not the predictor.
 - **Everything is inspectable.** Every prediction traces back to specific memory entries, source slots, and feature vectors. No black box.
 
 ## How It Works
@@ -43,6 +42,15 @@ The key insight: **voting tolerates compression**. To rank the correct response 
 
 ## Architecture
 
+The system has four modular components. Components 1-3 form a **fixed, deterministic position encoder** (no learned parameters). Component 4 is the only learned part.
+
+```
+  1. HashRetina          word → sparse slot IDs           O(1), deterministic
+  2. Multi-timescale EMA  slot × time → Q ∈ R^N           O(1)/step, per-slot independent
+  3. Cosine-Chaos Map     Q → φ ∈ R^D                     O(1), nonlinear expansion
+  4. Predictor            {(slot, φ)} → next_word          learned (bilinear voter, or any classifier)
+```
+
 ```
                               ┌─────────────────────────────┐
   Token ──→ Hash Retina ──→   │  Q: Multi-timescale EMA     │ ──→ Active slots
@@ -52,75 +60,108 @@ The key insight: **voting tolerates compression**. To rank the correct response 
                                              │
                               ┌──────────────▼──────────────┐
                               │  φ: Cosine-Chaos Feature Map │
-                              │  α=2 (edge of chaos)        │
-                              │  L recursive folds → ℝ^D    │
+                              │  P mixing + L recursive folds│
+                              │  bounded output ∈ [-1,1]^D   │
                               └──────────────┬──────────────┘
                                              │
-                         ┌───────────────────┼───────────────────┐
-                         │                                       │
-              ┌──────────▼──────────┐             ┌──────────────▼──────────┐
-              │  B: Short-Term      │             │  A: Long-Term           │
-              │  Sparse hash table  │             │  Slice-wise low-rank    │
-              │  Exact episodic     │             │  Generalized structure  │
-              │  traces             │             │  E_src[s], E_tgt[t]     │
-              │  (hippocampus)      │             │  ∈ ℝ^{d×D}             │
-              │                     │             │  (neocortex)            │
-              └──────────┬──────────┘             └──────────────┬──────────┘
-                         │    ℓ_B(t) = Σᵢ ⟨b_{sᵢ,t}, φ̂ᵢ⟩      │
-                         │                                       │
-                         │         ℓ_A(t) = ⟨E_tgt[t], C_A⟩_F   │
-                         └───────────────────┬───────────────────┘
-                                             │
                               ┌──────────────▼──────────────┐
-                              │  Categorical Vote            │
-                              │  ℓ(t) = ℓ_B(t) + ℓ_A(t)    │
-                              │  Predict: argmax_t ℓ(t)      │
+                              │  Predictor (modular)         │
+                              │  Current: bilinear low-rank  │
+                              │  E_src ⊙ φ → E_tgt → score  │
+                              │  Could be: MLP, Transformer  │
                               └──────────────────────────────┘
 ```
 
-### A: The Core Prediction Engine
+### Why This Works: EMA as Lossless Temporal Encoding
 
-A is the primary prediction module. It uses a **slice-wise low-rank factorization**: each slot `s` has two factor matrices `E_src[s]` and `E_tgt[s]` in `ℝ^{d×D}`, where `d` = CP_RANK (default 384). Prediction works as:
+The key mathematical insight: for any sequence of token activations, the multi-timescale EMA state Q ∈ R^N provides a **unique encoding** of the activation history. The decomposition of a signal onto exponential bases (ρ₁^t, ρ₂^t, ..., ρ_N^t) is unique -- this ensures the encoding does not collapse into mere frequency statistics.
+
+Two properties are critical:
+- **Near-field priority, far-field persistence.** Fast-decaying scales (small ρ) give high weight to recent tokens; slow-decaying scales (large ρ) retain distant context. This is not a sliding window -- all history contributes, with exponentially graded importance.
+- **Per-slot independence.** Each slot maintains its own Q vector. Slots are never summed or averaged. This preserves the identity of individual n-gram patterns and enables independent voting downstream.
+
+### Cosine-Chaos: Amplifying Micro-Differences
+
+Raw EMA states Q have very low discriminability -- different contexts produce nearly identical Q vectors (effective rank ~3-4 out of N=32 dimensions). The cosine-chaos map amplifies these micro-differences:
+
+```
+E = P @ (α_scale ⊙ Q).T       ← linear mixing (P provides cross-scale coupling)
+M₀ = 0
+Mₜ = cos(α · (shift(Mₜ₋₁) + E))   ← nonlinear folding, L iterations
+φ = M_L
+```
+
+Experimental findings on the φ encoding:
+- **P's mixing role is essential.** Removing P drops accuracy by ~10%. P provides full-connectivity across EMA scales that cyclic shift alone cannot efficiently achieve.
+- **P's singular value distribution matters.** Non-uniform singular values (as in random Gaussian P) create multi-resolution features: large singular values → high-frequency discrimination, small → low-frequency smoothness. This improves φ effective rank from ~21 to ~26.
+- **Folding depth L matters more than shift.** L=N (full cycle) gives the best results. With sufficient L, the chaos dynamics amplify even tiny Q differences into distinguishable φ vectors.
+- **The Lyapunov exponent should be slightly positive** (weak chaos, not critical). α=2.0 with L=N gives λ≈+0.16, which outperforms the theoretical critical point λ=0.
+
+### Current Predictor: Bilinear Low-Rank Voter
+
+The predictor uses a **slice-wise low-rank factorization**: each slot `s` has factor matrices `E_src[s]` and `E_tgt[s]` in `ℝ^{CP_RANK×D}`. Prediction:
 
 ```
 score[tgt] = Σ_src ⟨E_tgt[tgt], E_src[src] ⊙ φ(src)⟩_F / n_active
 ```
 
-The `d`-dimensional rank space acts as an **implicit hidden layer** -- each source doesn't directly vote on targets, but first projects through a learned abstract space. This provides representational abstraction without explicit multi-layer stacking.
+φ acts as an element-wise gate on E_src -- the same slot votes differently in different contexts. The CP_RANK-dimensional space provides implicit abstraction (a hidden layer without explicit stacking).
 
-A is trained by **dream sleep**: a batch optimization (AdamW + MSE loss) on pre-extracted `(φ, gold_word)` pairs. The EMA states and φ features are precomputed as fixed inputs -- only `E_src` and `E_tgt` are learned. This means backpropagation is used, but only within the prediction layer -- **not through time steps** (no BPTT). The temporal feature extraction pipeline (HashRetina → EMA → CosineChaos) is entirely deterministic and fixed.
+Trained by **dream sleep**: batch AdamW on pre-extracted (φ, gold_word) pairs. Backpropagation is used within the prediction layer only -- not through time steps (no BPTT). The entire temporal encoding pipeline is deterministic and fixed.
 
-### B: Short-Term Episodic Memory (Experimental)
+**This predictor is modular.** It could be replaced by an MLP, a small Transformer, or any classifier that takes {(slot_id, φ_vector)} as input. The encoding (components 1-3) is the core contribution.
 
-B is a sparse hash table that writes exact co-activation traces online (`Δb = η · gap · φ̂`). It serves as a fast episodic memory (hippocampus analog) that can capture patterns immediately. The original design uses B as a teacher for A during sleep consolidation.
+## How It Differs from Transformers and SSMs
 
-**Current status:** B's online wake learning has signal-to-noise limitations at scale. The v2 trainer bypasses B entirely, training A directly on gold data. Redesigning B as a proper episodic memory that tracks both input and output trajectories is an active research direction.
+| | **Transformer** | **SSM (S4/Mamba)** | **MathBrain** |
+|---|---|---|---|
+| **Context encoding** | Attend over all tokens O(N²) | Global state vector O(1) | Per-slot EMA O(V) |
+| **Information bottleneck** | None (full history) | State dimension | None (per-slot independent) |
+| **Inference cost** | O(N) or O(N²) | O(1) | O(V) per step |
+| **Online learning** | Requires retraining | Requires retraining | Native (predictor only) |
+| **Interpretability** | Post-hoc attention maps | Opaque state | Every vote traceable |
+| **Training** | BPTT through full sequence | BPTT through full sequence | Backprop in predictor only; no BPTT |
 
-## How It Differs from Transformers
+The key distinction from SSMs: SSMs compress the entire sequence into a single shared state vector -- all tokens mix into one representation. MathBrain maintains **per-slot independent** EMA states. This avoids the information bottleneck at the cost of O(V) rather than O(1) state size.
 
-| | **Transformer** | **MathBrain** |
-|---|---|---|
-| **Inference cost** | O(L) or O(L²) in sequence length | **O(1)** after EMA saturation |
-| **KV cache** | Grows with every token | No cache; bounded EMA state |
-| **Online learning** | Requires full retraining | Native: wake writes are instant |
-| **Interpretability** | Post-hoc attention maps | Every vote is an explicit memory trace |
-| **Memory model** | Implicit in weights | Explicit dual system with inspectable entries |
-| **Training** | Backprop through time | Backprop within prediction layer only; no BPTT through time steps |
-
-The tradeoff: MathBrain's prediction cost scales with vocabulary size O(V) rather than sequence length. It excels at continual, interpretable, bounded-state operation -- not at replacing large-scale language models on broad benchmarks.
+The tradeoff: MathBrain's cost scales with vocabulary/slot count O(V) rather than sequence length O(N). For bounded vocabularies, this is constant. It excels at continual, interpretable, bounded-state operation.
 
 ## Results
 
+All results are train-set accuracy (memorization) on TinyStories subsets. The claim is not SOTA on broad benchmarks, but viability of bounded-state encoding as a replacement for attention-based context aggregation.
+
 ### v2: Gold-Teacher Sleep (A-only, direct training)
 
-| Setting | N | D | Accuracy | Note |
-|---------|---|---|----------|------|
-| tinystories_10 (10 stories) | 4 | 8 | **99.41%** | Near-perfect memorization; ~10 errors are genuine ambiguity |
-| tinystories_60 (60 stories) | 4 | 8 | **99.06%** | Capacity holds at 6x corpus |
-| tinystories_200 (200 stories) | 4 | 8 | 71.14% | Context window too short (N=4, ~14 steps) |
-| tinystories_200 (200 stories) | 16 | 32 | **97.84%** | Extending EMA scales solves the context bottleneck |
+| Setting | N | D | CP_RANK | Accuracy | Note |
+|---------|---|---|---------|----------|------|
+| tinystories_10 | 4 | 8 | 384 | **99.41%** | Near-perfect; ~10 errors are genuine ambiguity |
+| tinystories_60 | 4 | 8 | 384 | **99.06%** | Capacity holds at 6x corpus |
+| tinystories_200 | 4 | 8 | 384 | 71.14% | Context window too short (half-life ~14 steps) |
+| tinystories_200 | 16 | 32 | 384 | **97.84%** | Extending EMA scales solves context bottleneck |
+| tinystories_200 | 8(sparse) | 32 | 384 | **97.13%** | Sparse RHO: fewer scales, wider coverage |
 
-**Key finding:** Scaling N (EMA timescales) and D (feature dimension) together is far more effective than stacking layers. N=16 extends the effective context window from ~14 to ~210 steps, which is sufficient for 200 stories.
+### φ Encoding Analysis (tinystories_60, N=D=32, CP_RANK=32)
+
+| P matrix | Singular values | φ effective rank | Accuracy |
+|----------|----------------|-----------------|----------|
+| Random Gaussian | Non-uniform (cond=50) | 25.9 | 97.96% |
+| Ortho × Gaussian SV | Non-uniform (cond=50) | 26.2 | **98.08%** |
+| Hadamard × Gaussian SV | Non-uniform (cond=50) | 24.9 | 97.90% |
+| Random Orthogonal | Uniform (cond=1) | 21.7 | 96.93% |
+| Hadamard | Uniform (cond=1) | 20.5 | 96.59% |
+| No P (D=N, chaos only) | N/A | ~18 | 87.22% |
+
+**Key finding:** P's non-uniform singular values create multi-resolution features that increase φ effective rank by ~25%. This is the dominant factor in encoding quality.
+
+| Folding config | shift | L | φ effective rank | Accuracy |
+|----------------|-------|---|-----------------|----------|
+| P + shift, L=1 (≈RFF) | yes | 1 | 24.9 | 97.42% |
+| P + shift, L=3 (default) | yes | 3 | 25.9 | 97.96% |
+| P + shift, L=N=32 | yes | 32 | 26.8 | **98.60%** |
+| P + no_shift, L=1 | no | 1 | 24.9 | 97.48% |
+| P + no_shift, L=N=32 | no | 32 | 26.7 | 98.26% |
+
+**Key finding:** A single cos(α·P@Q) (Random Fourier Features) already achieves 97.5%. Chaos folding with L=N adds ~1% by deepening the nonlinear kernel. Cyclic shift contributes ~0.3% on top of that.
 
 ### v1: Wake-Sleep with B (original architecture)
 
@@ -129,9 +170,6 @@ The tradeoff: MathBrain's prediction cost scales with vocabulary size O(V) rathe
 | tinystories_10, A+B | 92-93% | Combined dual memory |
 | tinystories_10, A-only after sleep | 84-86% | B as teacher, A as student |
 | tinystories_11_20, wake-only B | 87.0% | Pure online learning |
-| PTB first 200 lines | 85% | Standard benchmark |
-
-These results are on small-scale corpora. The claim is not SOTA on broad benchmarks, but viability of a fundamentally different regime: bounded state, categorical voting, and full interpretability.
 
 ## Quick Start
 
@@ -218,50 +256,43 @@ MathBrain/
 
 ### 1. Gold-Teacher Sleep: A-Only Training (v2)
 
-**Key discovery:** Bypassing B entirely and training A directly on gold (context, next_word) pairs produces dramatically better results than the B→A wake-sleep pipeline.
+Bypassing B entirely and training A directly on gold (context, next_word) pairs produces dramatically better results than the B→A wake-sleep pipeline. This reveals that the encoding pipeline (EMA + CosineChaos + HashRetina) is itself a powerful feature extractor -- B's noisy teacher signal was the bottleneck, not A's capacity.
 
-| Method | tinystories_10 |
-|--------|---------------|
-| v1: B wake → A sleep (B as teacher) | 84-86% A-only |
-| v1: A + B combined | 92-93% |
-| **v2: A trained directly on gold** | **99.41%** |
+### 2. φ Encoding: What Makes It Work
 
-This reveals that A's architecture (EMA + CosineChaos + HashRetina + low-rank factorization + independent voting) is itself a powerful sequence model. B's noisy teacher signal was the bottleneck, not A's capacity.
+We systematically decomposed the φ encoding pipeline to understand each component's contribution:
 
-### 2. Width Scaling: N and D
+- **P matrix (linear mixing):** Essential. Provides cross-scale coupling that cyclic shift cannot efficiently achieve. Non-uniform singular values (condition number ~50) create multi-resolution features, improving φ effective rank by ~25% over uniform orthogonal P.
+- **Cosine-chaos folding (nonlinear expansion):** L=N iterations give the best results (+1% over single cos). The chaos dynamics amplify micro-differences in Q into distinguishable φ features. Weak chaos (α=2.0, λ≈+0.16) outperforms exact criticality (λ=0).
+- **Cyclic shift (inter-dimension coupling):** Small contribution (~0.3%) when P already provides full mixing. Can be removed with minimal impact.
+- **Baseline: cos(α·P@Q) (Random Fourier Features):** Already achieves 97.5%. This is the irreducible core -- a single nonlinear projection of the mixed EMA state.
 
-**Key discovery:** When accuracy drops on larger corpora (200 stories: 71% with default N=4, D=8), the fix is **extending EMA timescales**, not adding layers.
+### 3. Width Scaling: N and D
 
-N (EMA scales) and D (φ dimension) must be scaled together -- D without more N doesn't add information, because the information source is the N-dimensional EMA state.
+When accuracy drops on larger corpora, the fix is extending EMA timescales (N), not adding layers. Sparse RHO distributions (few scales, wide coverage) are more parameter-efficient than dense distributions.
 
-| N | D | Max EMA half-life | tinystories_200 |
-|---|---|-------------------|-----------------|
-| 4 | 8 | ~14 steps | 71.14% |
-| 16 | 32 | ~210 steps | **97.84%** |
-
-**Why not multi-layer?** We investigated multi-layer stacking but found it unnecessary. The CP_RANK-dimensional low-rank space already provides implicit abstraction (each source projects through a 384-dim virtual space before voting on targets). The real bottleneck was temporal context, solved by wider EMA.
-
-### 3. Tree-Parallel Wake Training (v1)
+### 4. Tree-Parallel Wake Training (v1)
 
 **Script:** `experiments/run_parallel_wake.py`
 
-Because wake writes are local edge updates, they can be parallelized. The trainer freezes B, farms out shards in parallel, then tree-merges sparse deltas. Per-round cost drops from O(N) to O(k log N).
+Because wake writes are local edge updates, they can be parallelized. The trainer freezes B, farms out shards in parallel, then tree-merges sparse deltas.
 
 ## Current Status
 
 This is an active research project.
 
 **Working:**
-- Core architecture (HashRetina, EMA, CosineChaos, low-rank A) -- validated
-- PyTorch trainer with CUDA/MPS/CPU support, model save/load
-- 99.41% on tinystories_10 (N=4, D=8), 97.84% on tinystories_200 (N=16, D=32)
-- Width scaling (N, D) confirmed as the right axis for context extension
+- Core encoding pipeline (HashRetina → EMA → CosineChaos) validated as O(1) position encoder
+- PyTorch trainer with CUDA/MPS/CPU support, configurable N/D/CP_RANK/RHO
+- 97-99% train accuracy on TinyStories subsets (10-200 stories)
+- φ encoding mechanism understood: P mixing + nonlinear chaos folding + multi-resolution singular values
 
 **Open directions:**
-- Redesigning B as episodic memory that tracks both input and output trajectories
-- Scaling to larger corpora (1000+ stories, full TinyStories, PTB)
+- Replacing the bilinear voter with stronger predictors (MLP, small Transformer) to test encoding quality
+- Online self-distillation: compressing φ (context memory) into parameters during inference
+- Scaling to larger corpora and evaluating generalization (train/test split)
+- Optimizing P as a learnable component (Cayley-parameterized orthogonal + learnable singular values)
 - Systematic baselines against n-gram / LSTM / Transformer at matched parameter counts
-- Generalization evaluation (train/test split, not just memorization)
 
 ## Paper
 
