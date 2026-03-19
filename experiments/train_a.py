@@ -61,7 +61,7 @@ def print_rho(rho):
 
 
 def run_single(corpus, rho, D, cp_rank, epochs, batch_size, device,
-               save_path=None, log_interval=20,
+               save_path=None, log_interval=20, lr=0.01,
                predictor='linear', d_model=128, n_heads=4, n_layers=2,
                phi_mode='chaos', learnable_P=False):
     N = len(rho)
@@ -82,7 +82,7 @@ def run_single(corpus, rho, D, cp_rank, epochs, batch_size, device,
                                phi_mode=phi_mode, learnable_P=learnable_P)
 
     result = trainer.fit(corpus, epochs=epochs, batch_size=batch_size,
-                         log_interval=log_interval)
+                         log_interval=log_interval, lr=lr)
     eval_result = trainer.evaluate(corpus)
     print(f"  Accuracy: {eval_result['correct']}/{eval_result['total']} "
           f"= {eval_result['accuracy']:.2f}%")
@@ -109,6 +109,8 @@ def main():
                         help='Low-rank factorization rank (default: 384)')
     parser.add_argument('--epochs', type=int, default=320)
     parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=0.01,
+                        help='Learning rate (default: 0.01)')
     parser.add_argument('--log-interval', type=int, default=20)
     parser.add_argument('--device', default='auto',
                         help='auto, cuda, mps, or cpu')
@@ -169,6 +171,7 @@ def main():
         run_single(corpus, rho, D, args.cp_rank, args.epochs,
                    args.batch_size, args.device, args.save,
                    log_interval=args.log_interval,
+                   lr=args.lr,
                    predictor=args.predictor,
                    d_model=args.d_model,
                    n_heads=args.n_heads,

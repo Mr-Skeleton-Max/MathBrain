@@ -478,6 +478,7 @@ class MathBrainTrainer:
         best_state = None
 
         for epoch in range(epochs):
+            epoch_t0 = time.time()
             perm = torch.randperm(n_pos, device=self.device)
             epoch_loss = 0.0
 
@@ -507,7 +508,9 @@ class MathBrainTrainer:
                               for k, v in net.state_dict().items()}
 
             if epoch % log_interval == 0 or epoch == epochs - 1:
-                print(f"      epoch {epoch:4d}: loss={epoch_loss:.6f}")
+                epoch_ms = (time.time() - epoch_t0) * 1000
+                print(f"      epoch {epoch:4d}: loss={epoch_loss:.6f}  "
+                      f"({epoch_ms:.0f}ms, {n_batches} batches)")
 
         # 写回 — 保留完整 net 用于 evaluate
         net.load_state_dict(best_state)
