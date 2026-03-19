@@ -188,12 +188,13 @@ class _SleepModule(nn.Module):
 
         ctx_flat = weighted.view(B, d * D)  # view 不 copy（weighted 已连续）
 
-        slot_scores = ctx_flat @ self.E_tgt.t()  # (B, S)
+        # 关键 matmul 强制 fp32，防止 AMP fp16 溢出
+        slot_scores = ctx_flat.float() @ self.E_tgt.t().float()  # (B, S)
 
         active_count = b_mask.sum(1, keepdim=True).clamp(min=1.0)
         slot_scores = slot_scores / active_count
 
-        word_logits = slot_scores @ self.word_proj_t  # (B, V)
+        word_logits = slot_scores @ self.word_proj_t  # (B, V), word_proj_t 已是 fp32
         target_idx = b_target.argmax(dim=1)
         loss = F.cross_entropy(word_logits, target_idx)
         return loss
