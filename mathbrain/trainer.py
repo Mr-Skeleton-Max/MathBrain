@@ -158,45 +158,23 @@ class _SleepModule(nn.Module):
         self.E_tgt = nn.Parameter(torch.randn(S, d_rank * D_eff) * 0.01)
         self.register_buffer('word_proj_t', word_proj_t)
 
-    def forward(self, b_active, b_q, b_mask, b_target):
+    def forward(self, b_active, b_q, b_mask, b_target_idx):
         phi = self.chaos(b_q)  # (B, M, D)
-
         B, M, D = phi.shape
         d = self.d_rank
 
-        # E_src lookup: (B, M, d*D)
-        src_flat = self.E_src(b_active)
-
-        # phi * mask: (B, M, D)
-        phi_masked = phi * b_mask.unsqueeze(-1)
-
-        # 手动 bmm 替代 einsum，避免 reshape 触发 clone:
-        # 目标: ctx[b,r,d] = Σ_m src[b,m,r,d] * phi_masked[b,m,d]
-        #
-        # 重排为 bmm:
-        #   src_flat: (B, M, d*D) → (B*D, M, d) via permute
-        #   phi_masked: (B, M, D) → (B*D, M, 1)
-        #   bmm → (B*D, d, 1) → (B, D, d) → (B, d*D)
-        #
-        # 但这需要 permute 和 contiguous，同样有 copy 开销。
-        #
-        # 更好的方案: 把 einsum 拆成 element-wise mul + sum
-        # src_4d: (B, M, d, D) * phi_masked: (B, M, 1, D) → (B, M, d, D) → sum(dim=1) → (B, d, D)
+        src_flat = self.E_src(b_active)          # (B, M, d*D)
+        phi_masked = phi * b_mask.unsqueeze(-1)   # (B, M, D)
         src_4d = src_flat.view(B, M, d, D)
-        # 用 mul + sum 替代 einsum（PyTorch 对这个模式有更好的 fusion）
         weighted = (src_4d * phi_masked.unsqueeze(2)).sum(dim=1)  # (B, d, D)
+        ctx_flat = weighted.view(B, d * D)
 
-        ctx_flat = weighted.view(B, d * D)  # view 不 copy（weighted 已连续）
-
-        # Scoring: ctx → slot_scores → word_logits
-        slot_scores = ctx_flat @ self.E_tgt.t()  # (B, S)
-
+        slot_scores = ctx_flat @ self.E_tgt.t()   # (B, S)
         active_count = b_mask.sum(1, keepdim=True).clamp(min=1.0)
         slot_scores = slot_scores / active_count
 
-        word_logits = slot_scores @ self.word_proj_t  # (B, V), word_proj_t 已是 fp32
-        target_idx = b_target.argmax(dim=1)
-        loss = F.cross_entropy(word_logits, target_idx)
+        word_logits = slot_scores @ self.word_proj_t  # (B, V)
+        loss = F.cross_entropy(word_logits, b_target_idx)
         return loss
 
 
@@ -235,12 +213,11 @@ class _SleepModuleTransformer(nn.Module):
         self.slot_head = nn.Linear(d_model, S)
         self.register_buffer('word_proj_t', word_proj_t)
 
-    def forward(self, b_active, b_q, b_mask, b_target):
+    def forward(self, b_active, b_q, b_mask, b_target_idx):
         phi = self.chaos(b_q)  # (B, M, D_eff)
 
-        tok = self.slot_emb(b_active) + self.phi_proj(phi)  # (B, M, d_model)
+        tok = self.slot_emb(b_active) + self.phi_proj(phi)
         pad_mask = (b_mask == 0)
-
         out = self.transformer(tok, src_key_padding_mask=pad_mask)
 
         slot_logits = self.slot_head(out)  # (B, M, S)
@@ -250,8 +227,7 @@ class _SleepModuleTransformer(nn.Module):
         slot_scores = slot_scores / active_count
 
         word_logits = slot_scores @ self.word_proj_t
-        target_idx = b_target.argmax(dim=1)
-        loss = F.cross_entropy(word_logits, target_idx)
+        loss = F.cross_entropy(word_logits, b_target_idx)
         return loss
 
 
@@ -361,7 +337,7 @@ class MathBrainTrainer:
         active_local = np.zeros((n_pos, max_active), dtype=np.int64)
         q_padded = np.zeros((n_pos, max_active, feat_dim), dtype=np.float32)
         active_mask = np.zeros((n_pos, max_active), dtype=np.float32)
-        teacher_labels = np.zeros(n_pos, dtype=np.int64)
+        target_idx = np.zeros(n_pos, dtype=np.int64)
 
         for i, (act, q_sc, _, gw) in enumerate(positions):
             n = len(act)
@@ -369,16 +345,13 @@ class MathBrainTrainer:
             active_local[i, :n] = local_ids
             q_padded[i, :n] = q_sc
             active_mask[i, :n] = 1.0
-            teacher_labels[i] = word_to_idx.get(gw, 0)
-
-        one_hot = np.zeros((n_pos, V), dtype=np.float32)
-        one_hot[np.arange(n_pos), teacher_labels] = 1.0
+            target_idx[i] = word_to_idx.get(gw, 0)
 
         return {
             'active_local': torch.from_numpy(active_local),
             'q_padded': torch.from_numpy(q_padded),
             'active_mask': torch.from_numpy(active_mask),
-            'one_hot': torch.from_numpy(one_hot),
+            'target_idx': torch.from_numpy(target_idx),
             'S': S, 'V': V, 'feat_dim': feat_dim, 'n_pos': n_pos,
         }
 
@@ -418,11 +391,11 @@ class MathBrainTrainer:
               f"predictor={self.predictor}, phi_mode={self.phi_mode}, "
               f"learnable_P={self.learnable_P}")
 
-        # 数据 → device
-        active_local = data['active_local'].to(self.device)
-        q_padded = data['q_padded'].to(self.device)
-        active_mask = data['active_mask'].to(self.device)
-        one_hot = data['one_hot'].to(self.device)
+        # 数据 — 大 tensor 留在 CPU，per-batch 搬到 GPU
+        active_local = data['active_local']  # CPU
+        q_padded = data['q_padded']          # CPU
+        active_mask = data['active_mask']    # CPU
+        target_idx = data['target_idx'].to(self.device)  # (n_pos,) int64, 很小
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
@@ -478,7 +451,7 @@ class MathBrainTrainer:
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos, device=self.device)
+            perm = torch.randperm(n_pos)  # CPU — 数据在 CPU 上索引
             epoch_loss = 0.0
 
             for bi in range(n_batches):
@@ -486,10 +459,14 @@ class MathBrainTrainer:
                 e_idx = min(s_idx + batch_size, n_pos)
                 idx = perm[s_idx:e_idx]
 
+                # Per-batch CPU→GPU transfer (避免全量数据常驻 GPU)
+                b_active = active_local[idx].to(self.device, non_blocking=True)
+                b_q = q_padded[idx].to(self.device, non_blocking=True)
+                b_mask = active_mask[idx].to(self.device, non_blocking=True)
+                b_target = target_idx[idx]
+
                 optimizer.zero_grad(set_to_none=True)
-                loss = compiled_forward(
-                    active_local[idx], q_padded[idx],
-                    active_mask[idx], one_hot[idx])
+                loss = compiled_forward(b_active, b_q, b_mask, b_target)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
