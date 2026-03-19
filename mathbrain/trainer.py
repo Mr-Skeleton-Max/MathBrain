@@ -470,87 +470,134 @@ class MathBrainTrainer:
         # 预计算 offsets numpy 用于快速切片
         offsets_np = offsets_cpu.numpy()
         n_active_np = n_active_cpu.numpy()
+        max_active_global = int(n_active_cpu.max())
 
         slot_np = slot_flat_cpu.numpy()
         phi_np = phi_flat_cpu.numpy()
 
-        compact_gb = (slot_np.nbytes + phi_np.nbytes) / 1e9
-        print(f"  CPU compact: {compact_gb:.2f}GB, "
-              f"max_active={int(n_active_cpu.max())}")
+        # ── 一次性预 pad 所有数据（CPU numpy）──
+        print(f"  pre-padding {n_pos} positions (max_active={max_active_global})...")
+        all_active_np = np.zeros((n_pos, max_active_global), dtype=np.int64)
+        all_phi_np = np.zeros((n_pos, max_active_global, feat_dim), dtype=np.float32)
+        all_mask_np = np.zeros((n_pos, max_active_global), dtype=np.float32)
 
-        # ── 预加载 pipeline ──
-        # CPU 线程提前准备下一个 batch，GPU 计算当前 batch
-        import threading, queue
+        for i in range(n_pos):
+            s, e = offsets_np[i], offsets_np[i + 1]
+            n = e - s
+            all_active_np[i, :n] = slot_np[s:e]
+            all_phi_np[i, :n] = phi_np[s:e]
+            all_mask_np[i, :n] = 1.0
 
-        def build_padded_batch(batch_pos_list):
-            """CPU 上构建 padded batch 并传到 GPU。"""
-            B = len(batch_pos_list)
-            batch_n = n_active_np[batch_pos_list]
-            M = int(batch_n.max())
+        del slot_np, phi_np, slot_flat_cpu, phi_flat_cpu
 
-            # 直接在 numpy 里 pad（连续内存，memcpy 快）
-            b_active_np = np.zeros((B, M), dtype=np.int64)
-            b_phi_np = np.zeros((B, M, feat_dim), dtype=np.float32)
-            b_mask_np = np.zeros((B, M), dtype=np.float32)
+        # ── 尽量放 GPU，放不下的留 CPU pinned ──
+        all_active = torch.from_numpy(all_active_np)
+        all_phi = torch.from_numpy(all_phi_np)
+        all_mask = torch.from_numpy(all_mask_np)
+        del all_active_np, all_phi_np, all_mask_np
 
-            for j in range(B):
-                s = offsets_np[batch_pos_list[j]]
-                n = batch_n[j]
-                b_active_np[j, :n] = slot_np[s:s+n]
-                b_phi_np[j, :n] = phi_np[s:s+n]
-                b_mask_np[j, :n] = 1.0
+        if self.device.type == 'cuda':
+            total_bytes = all_active.nbytes + all_phi.nbytes + all_mask.nbytes
+            free_mem = torch.cuda.mem_get_info()[0]
+            # 留 500MB 给模型和中间结果
+            available = free_mem - 500 * 1024 * 1024
 
-            # numpy → pinned torch → GPU（non_blocking DMA）
-            b_active = torch.from_numpy(b_active_np).to(self.device, non_blocking=True)
-            b_phi = torch.from_numpy(b_phi_np).to(self.device, non_blocking=True)
-            b_mask = torch.from_numpy(b_mask_np).to(self.device, non_blocking=True)
-            return b_active, b_phi, b_mask
+            if total_bytes <= available:
+                # 全部放 GPU
+                all_active = all_active.to(self.device)
+                all_phi = all_phi.to(self.device)
+                all_mask = all_mask.to(self.device)
+                gpu_n_pos = n_pos
+                print(f"  全部 GPU: {total_bytes/1e9:.1f}GB")
+            else:
+                # 部分放 GPU，剩余 pinned CPU
+                # 按比例切分
+                ratio = available / total_bytes
+                gpu_n_pos = max(batch_size, int(n_pos * ratio))
+                gpu_n_pos = min(gpu_n_pos, n_pos)
 
-        def prefetch_worker(batch_queue, result_queue):
-            """后台线程：从 batch_queue 取 batch_pos，构建并传到 GPU。"""
-            while True:
-                item = batch_queue.get()
-                if item is None:
-                    result_queue.put(None)
-                    break
-                batch_pos, target_idx_batch = item
-                b_active, b_phi, b_mask = build_padded_batch(batch_pos)
-                result_queue.put((b_active, b_phi, b_mask, target_idx_batch))
+                # GPU 部分
+                gpu_active = all_active[:gpu_n_pos].to(self.device)
+                gpu_phi = all_phi[:gpu_n_pos].to(self.device)
+                gpu_mask = all_mask[:gpu_n_pos].to(self.device)
+
+                # CPU 部分（pinned memory for fast DMA）
+                cpu_active = all_active[gpu_n_pos:].pin_memory()
+                cpu_phi = all_phi[gpu_n_pos:].pin_memory()
+                cpu_mask = all_mask[gpu_n_pos:].pin_memory()
+
+                # 合并索引：GPU 部分 [0, gpu_n_pos)，CPU 部分 [gpu_n_pos, n_pos)
+                # 用一个 indirection 表记录每个 position 在哪
+                del all_active, all_phi, all_mask
+
+                all_active = (gpu_active, cpu_active)
+                all_phi = (gpu_phi, cpu_phi)
+                all_mask = (gpu_mask, cpu_mask)
+
+                cpu_bytes = (cpu_active.nbytes + cpu_phi.nbytes + cpu_mask.nbytes)
+                gpu_bytes = (gpu_active.nbytes + gpu_phi.nbytes + gpu_mask.nbytes)
+                print(f"  GPU: {gpu_n_pos} pos ({gpu_bytes/1e9:.1f}GB), "
+                      f"CPU pinned: {n_pos-gpu_n_pos} pos ({cpu_bytes/1e9:.1f}GB)")
+        else:
+            gpu_n_pos = 0  # CPU-only mode
+
+        is_split = isinstance(all_active, tuple)
+
+        # CUDA stream for async CPU→GPU transfer
+        xfer_stream = torch.cuda.Stream() if self.device.type == 'cuda' else None
+
+        # ── 按 position 位置排序 perm，使 GPU-resident 的排前面 ──
+        # 这样大部分 batch 全在 GPU 上，只有少数 batch 需要 CPU→GPU
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = np.random.permutation(n_pos)
+            perm = torch.randperm(n_pos)
             epoch_loss = 0.0
 
-            # 预生成所有 batch 的 position 列表
-            batches = []
             for bi in range(n_batches):
                 s_idx = bi * batch_size
                 e_idx = min(s_idx + batch_size, n_pos)
-                bp = perm[s_idx:e_idx]
-                bt = target_idx[torch.from_numpy(bp.copy()).to(self.device)]
-                batches.append((bp, bt))
+                idx = perm[s_idx:e_idx]
 
-            # 启动 prefetch 线程
-            batch_q = queue.Queue(maxsize=2)
-            result_q = queue.Queue(maxsize=2)
-            worker = threading.Thread(target=prefetch_worker,
-                                      args=(batch_q, result_q), daemon=True)
-            worker.start()
+                if not is_split:
+                    # 全 GPU — 最快路径
+                    b_active = all_active[idx]
+                    b_phi = all_phi[idx]
+                    b_mask = all_mask[idx]
+                    b_target = target_idx[idx]
+                else:
+                    # 混合路径：分离 GPU 和 CPU 索引
+                    gpu_mask_idx = idx < gpu_n_pos
+                    cpu_mask_idx = ~gpu_mask_idx
 
-            # 提前投喂前 2 个 batch
-            for bi in range(min(2, n_batches)):
-                batch_q.put(batches[bi])
+                    B = len(idx)
+                    M = max_active_global
+                    b_active = torch.zeros(B, M, dtype=torch.long, device=self.device)
+                    b_phi = torch.zeros(B, M, feat_dim, dtype=torch.float32, device=self.device)
+                    b_mask = torch.zeros(B, M, dtype=torch.float32, device=self.device)
 
-            for bi in range(n_batches):
-                # 取已准备好的 batch
-                result = result_q.get()
-                b_active, b_phi, b_mask, b_target = result
+                    # GPU 部分（直接索引，零开销）
+                    if gpu_mask_idx.any():
+                        g_idx = idx[gpu_mask_idx]
+                        g_pos = torch.where(gpu_mask_idx)[0]
+                        b_active[g_pos] = all_active[0][g_idx]
+                        b_phi[g_pos] = all_phi[0][g_idx]
+                        b_mask[g_pos] = all_mask[0][g_idx]
 
-                # 投喂下下个 batch（保持 pipeline 满）
-                next_bi = bi + 2
-                if next_bi < n_batches:
-                    batch_q.put(batches[next_bi])
+                    # CPU 部分（CUDA stream DMA，不阻塞 main stream）
+                    if cpu_mask_idx.any():
+                        c_idx = idx[cpu_mask_idx] - gpu_n_pos
+                        c_pos = torch.where(cpu_mask_idx)[0]
+                        with torch.cuda.stream(xfer_stream):
+                            ca = all_active[1][c_idx].to(self.device, non_blocking=True)
+                            cp = all_phi[1][c_idx].to(self.device, non_blocking=True)
+                            cm = all_mask[1][c_idx].to(self.device, non_blocking=True)
+                        torch.cuda.current_stream().wait_stream(xfer_stream)
+                        b_active[c_pos] = ca
+                        b_phi[c_pos] = cp
+                        b_mask[c_pos] = cm
+
+                    b_target = target_idx[idx.to(self.device)]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
@@ -561,11 +608,6 @@ class MathBrainTrainer:
                 scheduler.step()
 
                 epoch_loss += loss.item()
-
-            # 关闭 prefetch worker
-            batch_q.put(None)
-            result_q.get()  # 等待 worker 退出
-            worker.join()
 
             epoch_loss /= n_batches
 
