@@ -56,7 +56,7 @@ class _ChaosEncoder(nn.Module):
         super().__init__()
         self.N = N
         self.D = D
-        self.n_folds = n_folds
+        self.n_folds = D if n_folds < 0 else n_folds  # -1 → L=D
         self.alpha = alpha
         self.phi_mode = phi_mode
         self.learnable_P = learnable_P

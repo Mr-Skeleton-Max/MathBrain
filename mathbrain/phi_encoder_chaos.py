@@ -66,9 +66,9 @@ class PhiEncoderCosineChaos:
             alpha_base = np.pi * mean_one_minus_rho
             self.alpha_scale = (cfg.INVERSE_WEIGHT * alpha_base).astype(np.float32)
         else:
-            # Legacy 模式: 有 P
+            # 有 P 模式
             self.D = D
-            self.n_folds = n_folds
+            self.n_folds = D if n_folds < 0 else n_folds  # -1 → L=D (完整平移一圈)
             self.alpha = alpha
             sigma = cfg.PHI_SIGMA
             rng = np.random.RandomState(42)

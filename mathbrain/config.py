@@ -21,9 +21,9 @@ class MathBrainConfig:
     PHI_SIGMA: float = 0.5       # E_proj 初始化标准差（random/chaos 模式）
 
     # Cosine Chaos 编码器参数 (chaos 模式)
-    CHAOS_N_FOLDS: int = 3       # 折叠次数 L (推荐 1-3)
-    CHAOS_ALPHA: float = 2.0     # 混沌参数 α (2.0 为临界点)
-    CHAOS_NO_P: bool = False     # True: 去掉 P 投影，D=N, L=N, α=α*(N)
+    CHAOS_N_FOLDS: int = -1          # 折叠次数 L (-1 = 自动取 D_PHI，即完整平移一圈)
+    CHAOS_ALPHA: float = 2.1         # 混沌参数 α (2.0~2.2 弱混沌区间最优)
+    CHAOS_NO_P: bool = False         # True: 去掉 P 投影，D=N, L=N, α=α*(N)
 
     # 确定性傅里叶特征 (Deterministic Fourier Features)
     # D_COSINE = d = F_ALPHA * N * 2 (cos + sin)
