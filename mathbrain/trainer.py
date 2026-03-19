@@ -470,48 +470,87 @@ class MathBrainTrainer:
         # 预计算 offsets numpy 用于快速切片
         offsets_np = offsets_cpu.numpy()
         n_active_np = n_active_cpu.numpy()
-        max_active_global = int(n_active_cpu.max())
-
-        # 预 pad 到 CPU tensor（fp16 + int16 压缩，~8GB for tinystories_2000）
-        all_active = torch.zeros(n_pos, max_active_global, dtype=torch.int16)
-        all_phi = torch.zeros(n_pos, max_active_global, feat_dim, dtype=torch.float16)
-        all_mask = torch.zeros(n_pos, max_active_global, dtype=torch.float16)
 
         slot_np = slot_flat_cpu.numpy()
         phi_np = phi_flat_cpu.numpy()
-        for i in range(n_pos):
-            s, e = offsets_np[i], offsets_np[i + 1]
-            n = e - s
-            all_active[i, :n] = torch.from_numpy(slot_np[s:e].astype(np.int16))
-            all_phi[i, :n] = torch.from_numpy(phi_np[s:e]).half()
-            all_mask[i, :n] = 1.0
 
-        del slot_flat_cpu, phi_flat_cpu, offsets_np, slot_np, phi_np
+        compact_gb = (slot_np.nbytes + phi_np.nbytes) / 1e9
+        print(f"  CPU compact: {compact_gb:.2f}GB, "
+              f"max_active={int(n_active_cpu.max())}")
 
-        # pinned memory 加速 CPU→GPU
-        if self.device.type == 'cuda':
-            all_active = all_active.pin_memory()
-            all_phi = all_phi.pin_memory()
-            all_mask = all_mask.pin_memory()
+        # ── 预加载 pipeline ──
+        # CPU 线程提前准备下一个 batch，GPU 计算当前 batch
+        import threading, queue
 
-        mem_gb = (all_active.nbytes + all_phi.nbytes + all_mask.nbytes) / 1e9
-        print(f"  pre-padded CPU: {n_pos}×{max_active_global}, {mem_gb:.1f}GB")
+        def build_padded_batch(batch_pos_list):
+            """CPU 上构建 padded batch 并传到 GPU。"""
+            B = len(batch_pos_list)
+            batch_n = n_active_np[batch_pos_list]
+            M = int(batch_n.max())
+
+            # 直接在 numpy 里 pad（连续内存，memcpy 快）
+            b_active_np = np.zeros((B, M), dtype=np.int64)
+            b_phi_np = np.zeros((B, M, feat_dim), dtype=np.float32)
+            b_mask_np = np.zeros((B, M), dtype=np.float32)
+
+            for j in range(B):
+                s = offsets_np[batch_pos_list[j]]
+                n = batch_n[j]
+                b_active_np[j, :n] = slot_np[s:s+n]
+                b_phi_np[j, :n] = phi_np[s:s+n]
+                b_mask_np[j, :n] = 1.0
+
+            # numpy → pinned torch → GPU（non_blocking DMA）
+            b_active = torch.from_numpy(b_active_np).to(self.device, non_blocking=True)
+            b_phi = torch.from_numpy(b_phi_np).to(self.device, non_blocking=True)
+            b_mask = torch.from_numpy(b_mask_np).to(self.device, non_blocking=True)
+            return b_active, b_phi, b_mask
+
+        def prefetch_worker(batch_queue, result_queue):
+            """后台线程：从 batch_queue 取 batch_pos，构建并传到 GPU。"""
+            while True:
+                item = batch_queue.get()
+                if item is None:
+                    result_queue.put(None)
+                    break
+                batch_pos, target_idx_batch = item
+                b_active, b_phi, b_mask = build_padded_batch(batch_pos)
+                result_queue.put((b_active, b_phi, b_mask, target_idx_batch))
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos)
+            perm = np.random.permutation(n_pos)
             epoch_loss = 0.0
 
+            # 预生成所有 batch 的 position 列表
+            batches = []
             for bi in range(n_batches):
                 s_idx = bi * batch_size
                 e_idx = min(s_idx + batch_size, n_pos)
-                idx = perm[s_idx:e_idx]
+                bp = perm[s_idx:e_idx]
+                bt = target_idx[torch.from_numpy(bp.copy()).to(self.device)]
+                batches.append((bp, bt))
 
-                # CPU index → GPU transfer → cast（一步到位）
-                b_active = all_active[idx].to(self.device, non_blocking=True).long()
-                b_phi = all_phi[idx].to(self.device, non_blocking=True).float()
-                b_mask = all_mask[idx].to(self.device, non_blocking=True).float()
-                b_target = target_idx[idx.to(self.device)]
+            # 启动 prefetch 线程
+            batch_q = queue.Queue(maxsize=2)
+            result_q = queue.Queue(maxsize=2)
+            worker = threading.Thread(target=prefetch_worker,
+                                      args=(batch_q, result_q), daemon=True)
+            worker.start()
+
+            # 提前投喂前 2 个 batch
+            for bi in range(min(2, n_batches)):
+                batch_q.put(batches[bi])
+
+            for bi in range(n_batches):
+                # 取已准备好的 batch
+                result = result_q.get()
+                b_active, b_phi, b_mask, b_target = result
+
+                # 投喂下下个 batch（保持 pipeline 满）
+                next_bi = bi + 2
+                if next_bi < n_batches:
+                    batch_q.put(batches[next_bi])
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
@@ -522,6 +561,11 @@ class MathBrainTrainer:
                 scheduler.step()
 
                 epoch_loss += loss.item()
+
+            # 关闭 prefetch worker
+            batch_q.put(None)
+            result_q.get()  # 等待 worker 退出
+            worker.join()
 
             epoch_loss /= n_batches
 
