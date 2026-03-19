@@ -494,6 +494,8 @@ class MathBrainTrainer:
                         active_mask[idx], one_hot[idx])
 
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
