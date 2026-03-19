@@ -19,6 +19,7 @@ import time
 import math
 from pathlib import Path
 from typing import Dict, List, Union
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -470,120 +471,69 @@ class MathBrainTrainer:
         # 预计算 offsets numpy
         offsets_np = offsets_cpu.numpy()
         n_active_np = n_active_cpu.numpy()
-
         slot_np = slot_flat_cpu.numpy()
         phi_np = phi_flat_cpu.numpy()
-
-        compact_gb = (slot_np.nbytes + phi_np.nbytes) / 1e9
         max_active_global = int(n_active_cpu.max())
-        print(f"  CPU compact: {compact_gb:.2f}GB, max_active={max_active_global}")
 
-        # ── 尝试全量预 pad 放 GPU ──
+        # ── 预 pad 到 numpy（CPU RAM）──
         padded_bytes = n_pos * max_active_global * (8 + feat_dim * 4 + 4)
+        print(f"  pre-padding {n_pos}×{max_active_global} ({padded_bytes/1e9:.1f}GB)...")
+
+        all_active_np = np.zeros((n_pos, max_active_global), dtype=np.int64)
+        all_phi_np = np.zeros((n_pos, max_active_global, feat_dim), dtype=np.float32)
+        all_mask_np = np.zeros((n_pos, max_active_global), dtype=np.float32)
+        for i in range(n_pos):
+            s, e = offsets_np[i], offsets_np[i + 1]
+            n = e - s
+            all_active_np[i, :n] = slot_np[s:e]
+            all_phi_np[i, :n] = phi_np[s:e]
+            all_mask_np[i, :n] = 1.0
+        del slot_np, phi_np, slot_flat_cpu, phi_flat_cpu
+
+        # ── 尝试放 GPU ──
         free_mem = torch.cuda.mem_get_info()[0] if self.device.type == 'cuda' else 0
-        available = free_mem - 200 * 1024 * 1024
-
-        if padded_bytes <= available:
-            # 全部放 GPU — 最快路径
-            print(f"  pre-padding → GPU ({padded_bytes/1e9:.1f}GB)...")
-            all_active = torch.zeros(n_pos, max_active_global, dtype=torch.long,
-                                     device=self.device)
-            all_phi = torch.zeros(n_pos, max_active_global, feat_dim,
-                                  dtype=torch.float32, device=self.device)
-            all_mask = torch.zeros(n_pos, max_active_global,
-                                   dtype=torch.float32, device=self.device)
-            for i in range(n_pos):
-                s, e = offsets_np[i], offsets_np[i + 1]
-                n = e - s
-                all_active[i, :n] = torch.from_numpy(slot_np[s:e].astype(np.int64))
-                all_phi[i, :n] = torch.from_numpy(phi_np[s:e])
-                all_mask[i, :n] = 1.0
+        if padded_bytes <= free_mem - 200 * 1024 * 1024:
+            all_active = torch.from_numpy(all_active_np).to(self.device)
+            all_phi = torch.from_numpy(all_phi_np).to(self.device)
+            all_mask = torch.from_numpy(all_mask_np).to(self.device)
+            del all_active_np, all_phi_np, all_mask_np
             data_mode = 'gpu'
+            print(f"  → GPU ({padded_bytes/1e9:.1f}GB)")
         else:
-            # 流式加载 — 后台线程按顺序准备 batch
-            print(f"  流式模式 (padded {padded_bytes/1e9:.1f}GB > GPU {available/1e9:.1f}GB)")
-            data_mode = 'stream'
-
-        import threading, queue
-
-        def build_batch_on_gpu(batch_pos):
-            """从紧凑 numpy 构建 padded batch，直接放 GPU。"""
-            B = len(batch_pos)
-            batch_n = n_active_np[batch_pos]
-            M = int(batch_n.max())
-
-            b_a = np.zeros((B, M), dtype=np.int64)
-            b_p = np.zeros((B, M, feat_dim), dtype=np.float32)
-            b_m = np.zeros((B, M), dtype=np.float32)
-
-            for j in range(B):
-                s = offsets_np[batch_pos[j]]
-                n = batch_n[j]
-                b_a[j, :n] = slot_np[s:s+n]
-                b_p[j, :n] = phi_np[s:s+n]
-                b_m[j, :n] = 1.0
-
-            return (torch.from_numpy(b_a).to(self.device, non_blocking=True),
-                    torch.from_numpy(b_p).to(self.device, non_blocking=True),
-                    torch.from_numpy(b_m).to(self.device, non_blocking=True))
-
-        def loader_thread(batch_list, out_queue):
-            """按顺序构建 batch 并放入队列。"""
-            for bp in batch_list:
-                ba, bp_t, bm = build_batch_on_gpu(bp)
-                out_queue.put((ba, bp_t, bm))
-            out_queue.put(None)  # sentinel
+            all_active = torch.from_numpy(all_active_np)
+            all_phi = torch.from_numpy(all_phi_np)
+            all_mask = torch.from_numpy(all_mask_np)
+            data_mode = 'cpu'
+            print(f"  → CPU ({padded_bytes/1e9:.1f}GB, GPU 不够)")
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = np.random.permutation(n_pos)
+            if data_mode == 'gpu':
+                perm = torch.randperm(n_pos, device=self.device)
+            else:
+                perm = torch.randperm(n_pos)
             epoch_loss = 0.0
 
-            if data_mode == 'gpu':
-                # 全 GPU 路径 — 纯 CUDA 索引，零 CPU 开销
-                perm_gpu = torch.from_numpy(perm).to(self.device)
-                for bi in range(n_batches):
-                    idx = perm_gpu[bi * batch_size : min((bi+1) * batch_size, n_pos)]
+            for bi in range(n_batches):
+                idx = perm[bi * batch_size : min((bi+1) * batch_size, n_pos)]
+                if data_mode == 'gpu':
                     b_active = all_active[idx]
                     b_phi = all_phi[idx]
                     b_mask = all_mask[idx]
                     b_target = target_idx[idx]
+                else:
+                    b_active = all_active[idx].to(self.device, non_blocking=True)
+                    b_phi = all_phi[idx].to(self.device, non_blocking=True)
+                    b_mask = all_mask[idx].to(self.device, non_blocking=True)
+                    b_target = target_idx[idx.to(self.device)]
 
-                    optimizer.zero_grad(set_to_none=True)
-                    loss = compiled_forward(b_active, b_phi, b_mask, b_target)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    epoch_loss += loss.item()
-            else:
-                # 流式路径 — 后台线程提前准备下一个 batch
-                batch_positions = []
-                for bi in range(n_batches):
-                    s = bi * batch_size
-                    e = min(s + batch_size, n_pos)
-                    batch_positions.append(perm[s:e])
-
-                out_q = queue.Queue(maxsize=2)
-                t = threading.Thread(target=loader_thread,
-                                     args=(batch_positions, out_q), daemon=True)
-                t.start()
-
-                for bi in range(n_batches):
-                    ba, bp, bm = out_q.get()
-                    bt = target_idx[torch.from_numpy(
-                        batch_positions[bi].copy()).to(self.device)]
-
-                    optimizer.zero_grad(set_to_none=True)
-                    loss = compiled_forward(ba, bp, bm, bt)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    epoch_loss += loss.item()
-
-                out_q.get()  # consume sentinel
-                t.join()
+                optimizer.zero_grad(set_to_none=True)
+                loss = compiled_forward(b_active, b_phi, b_mask, b_target)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                epoch_loss += loss.item()
 
             epoch_loss /= n_batches
 
