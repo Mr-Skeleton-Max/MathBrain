@@ -470,89 +470,48 @@ class MathBrainTrainer:
         # 预计算 offsets numpy 用于快速切片
         offsets_np = offsets_cpu.numpy()
         n_active_np = n_active_cpu.numpy()
+        max_active_global = int(n_active_cpu.max())
 
-        # ── batch 准备函数（CPU gather + GPU pad）──
-        def prepare_batch(batch_pos):
-            """从紧凑数据构建 padded batch，返回 GPU tensors。"""
-            B = len(batch_pos)
-            batch_n = n_active_np[batch_pos]
-            M = int(batch_n.max())
-            total = int(batch_n.sum())
+        # 预 pad 到 CPU tensor（fp16 + int16 压缩，~8GB for tinystories_2000）
+        all_active = torch.zeros(n_pos, max_active_global, dtype=torch.int16)
+        all_phi = torch.zeros(n_pos, max_active_global, feat_dim, dtype=torch.float16)
+        all_mask = torch.zeros(n_pos, max_active_global, dtype=torch.float16)
 
-            # CPU 向量化 gather
-            batch_off = np.empty(B + 1, dtype=np.int64)
-            batch_off[0] = 0
-            np.cumsum(batch_n, out=batch_off[1:])
+        slot_np = slot_flat_cpu.numpy()
+        phi_np = phi_flat_cpu.numpy()
+        for i in range(n_pos):
+            s, e = offsets_np[i], offsets_np[i + 1]
+            n = e - s
+            all_active[i, :n] = torch.from_numpy(slot_np[s:e].astype(np.int16))
+            all_phi[i, :n] = torch.from_numpy(phi_np[s:e]).half()
+            all_mask[i, :n] = 1.0
 
-            src_starts = offsets_np[batch_pos]
-            base = np.repeat(src_starts, batch_n)
-            inner = np.arange(total) - np.repeat(batch_off[:-1], batch_n)
-            src_idx = base + inner
+        del slot_flat_cpu, phi_flat_cpu, offsets_np, slot_np, phi_np
 
-            b_slots_cpu = slot_flat_cpu[src_idx]
-            b_phis_cpu = phi_flat_cpu[src_idx]
+        # pinned memory 加速 CPU→GPU
+        if self.device.type == 'cuda':
+            all_active = all_active.pin_memory()
+            all_phi = all_phi.pin_memory()
+            all_mask = all_mask.pin_memory()
 
-            return b_slots_cpu, b_phis_cpu, batch_n, batch_off, B, M, total
-
-        def scatter_to_gpu(b_slots_cpu, b_phis_cpu, batch_n, batch_off,
-                           B, M, total, stream=None):
-            """CPU→GPU transfer + 向量化 scatter pad。在指定 stream 上执行。"""
-            ctx = torch.cuda.stream(stream) if stream else nullcontext()
-            with ctx:
-                b_slots_gpu = b_slots_cpu.to(self.device, non_blocking=True)
-                b_phis_gpu = b_phis_cpu.to(self.device, non_blocking=True)
-                batch_n_gpu = torch.from_numpy(batch_n.copy()).to(self.device,
-                                                                   non_blocking=True)
-
-                row_idx = torch.arange(B, device=self.device).repeat_interleave(batch_n_gpu)
-                col_off = torch.zeros(B + 1, dtype=torch.long, device=self.device)
-                col_off[1:] = batch_n_gpu.cumsum(0)
-                flat_idx = torch.arange(total, device=self.device)
-                col_idx = flat_idx - col_off[:-1].repeat_interleave(batch_n_gpu)
-
-                b_active = torch.zeros(B, M, dtype=torch.long, device=self.device)
-                b_phi = torch.zeros(B, M, feat_dim, dtype=torch.float32, device=self.device)
-                b_mask = torch.zeros(B, M, dtype=torch.float32, device=self.device)
-
-                b_active[row_idx, col_idx] = b_slots_gpu
-                b_phi[row_idx, col_idx] = b_phis_gpu
-                b_mask[row_idx, col_idx] = 1.0
-
-            return b_active, b_phi, b_mask
-
-        # CUDA prefetch stream
-        from contextlib import nullcontext
-        use_prefetch = self.device.type == 'cuda'
-        prefetch_stream = torch.cuda.Stream() if use_prefetch else None
+        mem_gb = (all_active.nbytes + all_phi.nbytes + all_mask.nbytes) / 1e9
+        print(f"  pre-padded CPU: {n_pos}×{max_active_global}, {mem_gb:.1f}GB")
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = np.random.permutation(n_pos)
+            perm = torch.randperm(n_pos)
             epoch_loss = 0.0
 
-            # Prefetch 第一个 batch
-            s0, e0 = 0, min(batch_size, n_pos)
-            prep0 = prepare_batch(perm[s0:e0])
-            next_batch = scatter_to_gpu(*prep0, stream=prefetch_stream)
-            next_target = target_idx[torch.from_numpy(perm[s0:e0].copy()).to(self.device)]
-
             for bi in range(n_batches):
-                # 等待 prefetch 完成
-                if use_prefetch:
-                    torch.cuda.current_stream().wait_stream(prefetch_stream)
-                b_active, b_phi, b_mask = next_batch
-                b_target = next_target
+                s_idx = bi * batch_size
+                e_idx = min(s_idx + batch_size, n_pos)
+                idx = perm[s_idx:e_idx]
 
-                # 启动下一个 batch 的 prefetch（和当前 batch 的 forward/backward 并行）
-                next_bi = bi + 1
-                if next_bi < n_batches:
-                    ns = next_bi * batch_size
-                    ne = min(ns + batch_size, n_pos)
-                    next_pos = perm[ns:ne]
-                    prep_next = prepare_batch(next_pos)
-                    next_batch = scatter_to_gpu(*prep_next, stream=prefetch_stream)
-                    next_target = target_idx[
-                        torch.from_numpy(next_pos.copy()).to(self.device)]
+                # CPU index → GPU transfer → cast（一步到位）
+                b_active = all_active[idx].to(self.device, non_blocking=True).long()
+                b_phi = all_phi[idx].to(self.device, non_blocking=True).float()
+                b_mask = all_mask[idx].to(self.device, non_blocking=True).float()
+                b_target = target_idx[idx.to(self.device)]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
