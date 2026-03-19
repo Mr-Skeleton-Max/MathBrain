@@ -329,29 +329,34 @@ class MathBrainTrainer:
                     word_proj[wi, compact] = 1.0 / len(compact)
         self._word_proj = word_proj
 
-        # pad positions
+        # 紧凑存储：无 padding，用 offsets 索引
         n_pos = len(positions)
-        feat_dim = positions[0][1].shape[1]  # D (chaos precomputed) or N (raw/learnable)
-        max_active = max(len(p[0]) for p in positions)
+        feat_dim = positions[0][1].shape[1]
 
-        active_local = np.zeros((n_pos, max_active), dtype=np.int64)
-        q_padded = np.zeros((n_pos, max_active, feat_dim), dtype=np.float32)
-        active_mask = np.zeros((n_pos, max_active), dtype=np.float32)
+        # 统计总 active slots
+        n_active_list = [len(p[0]) for p in positions]
+        total_active = sum(n_active_list)
+        offsets = np.zeros(n_pos + 1, dtype=np.int64)
+        np.cumsum(n_active_list, out=offsets[1:])
+
+        # 紧凑数组
+        slot_flat = np.zeros(total_active, dtype=np.int64)
+        phi_flat = np.zeros((total_active, feat_dim), dtype=np.float32)
         target_idx = np.zeros(n_pos, dtype=np.int64)
 
-        for i, (act, q_sc, _, gw) in enumerate(positions):
+        for i, (act, feat, _, gw) in enumerate(positions):
             n = len(act)
-            local_ids = [self._slot_to_compact[int(s)] for s in act]
-            active_local[i, :n] = local_ids
-            q_padded[i, :n] = q_sc
-            active_mask[i, :n] = 1.0
+            s, e = offsets[i], offsets[i + 1]
+            slot_flat[s:e] = [self._slot_to_compact[int(a)] for a in act]
+            phi_flat[s:e] = feat
             target_idx[i] = word_to_idx.get(gw, 0)
 
         return {
-            'active_local': torch.from_numpy(active_local),
-            'q_padded': torch.from_numpy(q_padded),
-            'active_mask': torch.from_numpy(active_mask),
+            'slot_flat': torch.from_numpy(slot_flat),
+            'phi_flat': torch.from_numpy(phi_flat),
+            'offsets': torch.from_numpy(offsets),
             'target_idx': torch.from_numpy(target_idx),
+            'n_active': torch.tensor(n_active_list, dtype=torch.int32),
             'S': S, 'V': V, 'feat_dim': feat_dim, 'n_pos': n_pos,
         }
 
@@ -391,22 +396,19 @@ class MathBrainTrainer:
               f"predictor={self.predictor}, phi_mode={self.phi_mode}, "
               f"learnable_P={self.learnable_P}")
 
-        # 数据 → GPU（one_hot 已消除，显存占用大幅降低）
-        # 如果 OOM，fallback 到 CPU + per-batch transfer
-        try:
-            active_local = data['active_local'].to(self.device)
-            q_padded = data['q_padded'].to(self.device)
-            active_mask = data['active_mask'].to(self.device)
-            target_idx = data['target_idx'].to(self.device)
-            data_on_gpu = True
-        except RuntimeError:
-            # OOM — 用 pinned memory 加速 CPU→GPU transfer
-            active_local = data['active_local'].pin_memory()
-            q_padded = data['q_padded'].pin_memory()
-            active_mask = data['active_mask'].pin_memory()
-            target_idx = data['target_idx'].to(self.device)
-            data_on_gpu = False
-            print("  [注意] 数据过大，使用 CPU + pinned memory 模式")
+        total_active = data['offsets'][-1].item()
+        compact_mb = (total_active * (8 + feat_dim * 4)) / 1e6
+        max_active = int(data['n_active'].max())
+        padded_mb = (n_pos * max_active * (8 + feat_dim * 4)) / 1e6
+        print(f"  compact storage: {compact_mb:.0f}MB "
+              f"(vs padded {padded_mb:.0f}MB, {compact_mb/padded_mb:.0%})")
+
+        # 紧凑数据 → GPU
+        slot_flat = data['slot_flat'].to(self.device)
+        phi_flat = data['phi_flat'].to(self.device)
+        offsets = data['offsets']  # CPU (用于 Python 索引)
+        n_active = data['n_active']  # CPU
+        target_idx = data['target_idx'].to(self.device)
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
@@ -462,28 +464,37 @@ class MathBrainTrainer:
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos, device=self.device if data_on_gpu else 'cpu')
+            perm = torch.randperm(n_pos)
             epoch_loss = 0.0
 
             for bi in range(n_batches):
                 s_idx = bi * batch_size
                 e_idx = min(s_idx + batch_size, n_pos)
-                idx = perm[s_idx:e_idx]
+                batch_idx = perm[s_idx:e_idx]
+                B = len(batch_idx)
 
-                if data_on_gpu:
-                    b_active = active_local[idx]
-                    b_q = q_padded[idx]
-                    b_mask = active_mask[idx]
-                    b_target = target_idx[idx]
-                else:
-                    # CPU → GPU per-batch (pinned memory → non_blocking)
-                    b_active = active_local[idx].to(self.device, non_blocking=True)
-                    b_q = q_padded[idx].to(self.device, non_blocking=True)
-                    b_mask = active_mask[idx].to(self.device, non_blocking=True)
-                    b_target = target_idx[idx]
+                # 当前 batch 的 max_active（远小于全局 max）
+                batch_n_active = n_active[batch_idx]
+                M = int(batch_n_active.max())
+
+                # 构建 padded batch（只 pad 到当前 batch 的 max）
+                b_active = torch.zeros(B, M, dtype=torch.long, device=self.device)
+                b_phi = torch.zeros(B, M, feat_dim, dtype=torch.float32, device=self.device)
+                b_mask = torch.zeros(B, M, dtype=torch.float32, device=self.device)
+
+                # 向量化填充：用 arange + 索引避免 Python for 循环
+                for j in range(B):
+                    pi = batch_idx[j].item()
+                    n = offsets[pi + 1].item() - offsets[pi].item()
+                    s = offsets[pi].item()
+                    b_active[j, :n] = slot_flat[s:s+n]
+                    b_phi[j, :n] = phi_flat[s:s+n]
+                    b_mask[j, :n] = 1.0
+
+                b_target = target_idx[batch_idx]
 
                 optimizer.zero_grad(set_to_none=True)
-                loss = compiled_forward(b_active, b_q, b_mask, b_target)
+                loss = compiled_forward(b_active, b_phi, b_mask, b_target)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
