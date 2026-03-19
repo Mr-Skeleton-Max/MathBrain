@@ -412,34 +412,17 @@ class MathBrainTrainer:
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
-        # 预构建 padded buffer（CPU 上一次性完成，避免训练循环中的 Python for）
+        # 预构建 per-position 索引表（避免训练循环中的 Python for）
+        # 对每个 position，生成 (row_idx, col_idx) 对，用于 scatter 到 padded batch
         max_active_global = int(n_active.max())
-        all_active = torch.zeros(n_pos, max_active_global, dtype=torch.long)
-        all_phi = torch.zeros(n_pos, max_active_global, feat_dim, dtype=torch.float32)
-        all_mask = torch.zeros(n_pos, max_active_global, dtype=torch.float32)
-
         offsets_np = offsets.numpy()
+
+        # 预构建 padded 索引：position i 的第 j 个 slot → flat index offsets[i]+j
+        # 用于 batch 构建时的向量化 scatter
+        pos_slot_indices = []  # 每个 position 的 flat 起始索引
         for i in range(n_pos):
-            s, e = offsets_np[i], offsets_np[i + 1]
-            n = e - s
-            all_active[i, :n] = slot_flat_cpu[s:e]
-            all_phi[i, :n] = phi_flat_cpu[s:e]
-            all_mask[i, :n] = 1.0
-
-        del slot_flat_cpu, phi_flat_cpu  # 释放紧凑数据
-
-        # 尝试放 GPU
-        try:
-            all_active = all_active.to(self.device)
-            all_phi = all_phi.to(self.device)
-            all_mask = all_mask.to(self.device)
-            data_on_gpu = True
-        except RuntimeError:
-            all_active = all_active.pin_memory()
-            all_phi = all_phi.pin_memory()
-            all_mask = all_mask.pin_memory()
-            data_on_gpu = False
-            print("  [注意] padded 数据过大，使用 pinned CPU 模式")
+            pos_slot_indices.append((offsets_np[i], offsets_np[i+1]))
+        pos_slot_indices = np.array(pos_slot_indices, dtype=np.int64)  # (n_pos, 2)
 
         P_init = self.model.phi_encoder.P  # (D, N) numpy or None
 
@@ -493,23 +476,40 @@ class MathBrainTrainer:
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos, device=self.device if data_on_gpu else 'cpu')
+            perm = torch.randperm(n_pos)
             epoch_loss = 0.0
 
             for bi in range(n_batches):
                 s_idx = bi * batch_size
                 e_idx = min(s_idx + batch_size, n_pos)
-                idx = perm[s_idx:e_idx]
+                batch_idx = perm[s_idx:e_idx].numpy()
+                B = len(batch_idx)
 
-                if data_on_gpu:
-                    b_active = all_active[idx]
-                    b_phi = all_phi[idx]
-                    b_mask = all_mask[idx]
-                else:
-                    b_active = all_active[idx].to(self.device, non_blocking=True)
-                    b_phi = all_phi[idx].to(self.device, non_blocking=True)
-                    b_mask = all_mask[idx].to(self.device, non_blocking=True)
-                b_target = target_idx[idx]
+                # 当前 batch 的 max_active
+                batch_ranges = pos_slot_indices[batch_idx]  # (B, 2)
+                batch_lens = batch_ranges[:, 1] - batch_ranges[:, 0]  # (B,)
+                M = int(batch_lens.max())
+
+                # 向量化构建 padded batch（CPU numpy → 一次性 to GPU）
+                b_active_np = np.zeros((B, M), dtype=np.int64)
+                b_phi_np = np.zeros((B, M, feat_dim), dtype=np.float32)
+                b_mask_np = np.zeros((B, M), dtype=np.float32)
+
+                # 用 numpy 切片填充（比 torch 快，避免 GPU 同步）
+                slot_np = slot_flat_cpu.numpy()
+                phi_np = phi_flat_cpu.numpy()
+                for j in range(B):
+                    s, e = batch_ranges[j]
+                    n = e - s
+                    b_active_np[j, :n] = slot_np[s:e]
+                    b_phi_np[j, :n] = phi_np[s:e]
+                    b_mask_np[j, :n] = 1.0
+
+                # 一次性 CPU→GPU（3 次 transfer 而不是 B*3 次）
+                b_active = torch.from_numpy(b_active_np).to(self.device, non_blocking=True)
+                b_phi = torch.from_numpy(b_phi_np).to(self.device, non_blocking=True)
+                b_mask = torch.from_numpy(b_mask_np).to(self.device, non_blocking=True)
+                b_target = target_idx[torch.from_numpy(batch_idx).to(self.device)]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
