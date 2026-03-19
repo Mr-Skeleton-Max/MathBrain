@@ -391,11 +391,22 @@ class MathBrainTrainer:
               f"predictor={self.predictor}, phi_mode={self.phi_mode}, "
               f"learnable_P={self.learnable_P}")
 
-        # 数据 — 大 tensor 留在 CPU，per-batch 搬到 GPU
-        active_local = data['active_local']  # CPU
-        q_padded = data['q_padded']          # CPU
-        active_mask = data['active_mask']    # CPU
-        target_idx = data['target_idx'].to(self.device)  # (n_pos,) int64, 很小
+        # 数据 → GPU（one_hot 已消除，显存占用大幅降低）
+        # 如果 OOM，fallback 到 CPU + per-batch transfer
+        try:
+            active_local = data['active_local'].to(self.device)
+            q_padded = data['q_padded'].to(self.device)
+            active_mask = data['active_mask'].to(self.device)
+            target_idx = data['target_idx'].to(self.device)
+            data_on_gpu = True
+        except RuntimeError:
+            # OOM — 用 pinned memory 加速 CPU→GPU transfer
+            active_local = data['active_local'].pin_memory()
+            q_padded = data['q_padded'].pin_memory()
+            active_mask = data['active_mask'].pin_memory()
+            target_idx = data['target_idx'].to(self.device)
+            data_on_gpu = False
+            print("  [注意] 数据过大，使用 CPU + pinned memory 模式")
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
@@ -451,7 +462,7 @@ class MathBrainTrainer:
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos)  # CPU — 数据在 CPU 上索引
+            perm = torch.randperm(n_pos, device=self.device if data_on_gpu else 'cpu')
             epoch_loss = 0.0
 
             for bi in range(n_batches):
@@ -459,11 +470,17 @@ class MathBrainTrainer:
                 e_idx = min(s_idx + batch_size, n_pos)
                 idx = perm[s_idx:e_idx]
 
-                # Per-batch CPU→GPU transfer (避免全量数据常驻 GPU)
-                b_active = active_local[idx].to(self.device, non_blocking=True)
-                b_q = q_padded[idx].to(self.device, non_blocking=True)
-                b_mask = active_mask[idx].to(self.device, non_blocking=True)
-                b_target = target_idx[idx]
+                if data_on_gpu:
+                    b_active = active_local[idx]
+                    b_q = q_padded[idx]
+                    b_mask = active_mask[idx]
+                    b_target = target_idx[idx]
+                else:
+                    # CPU → GPU per-batch (pinned memory → non_blocking)
+                    b_active = active_local[idx].to(self.device, non_blocking=True)
+                    b_q = q_padded[idx].to(self.device, non_blocking=True)
+                    b_mask = active_mask[idx].to(self.device, non_blocking=True)
+                    b_target = target_idx[idx]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_q, b_mask, b_target)
