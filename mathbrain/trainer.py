@@ -471,58 +471,88 @@ class MathBrainTrainer:
         offsets_np = offsets_cpu.numpy()
         n_active_np = n_active_cpu.numpy()
 
-        for epoch in range(epochs):
-            epoch_t0 = time.time()
-            perm = np.random.permutation(n_pos)
-            epoch_loss = 0.0
+        # ── batch 准备函数（CPU gather + GPU pad）──
+        def prepare_batch(batch_pos):
+            """从紧凑数据构建 padded batch，返回 GPU tensors。"""
+            B = len(batch_pos)
+            batch_n = n_active_np[batch_pos]
+            M = int(batch_n.max())
+            total = int(batch_n.sum())
 
-            for bi in range(n_batches):
-                s_idx = bi * batch_size
-                e_idx = min(s_idx + batch_size, n_pos)
-                batch_pos = perm[s_idx:e_idx]
-                B = len(batch_pos)
+            # CPU 向量化 gather
+            batch_off = np.empty(B + 1, dtype=np.int64)
+            batch_off[0] = 0
+            np.cumsum(batch_n, out=batch_off[1:])
 
-                # 当前 batch 的 max_active（远小于全局 max）
-                batch_n = n_active_np[batch_pos]
-                M = int(batch_n.max())
+            src_starts = offsets_np[batch_pos]
+            base = np.repeat(src_starts, batch_n)
+            inner = np.arange(total) - np.repeat(batch_off[:-1], batch_n)
+            src_idx = base + inner
 
-                # 收集该 batch 的紧凑数据段（向量化）
-                total_in_batch = int(batch_n.sum())
-                batch_offsets = np.empty(B + 1, dtype=np.int64)
-                batch_offsets[0] = 0
-                np.cumsum(batch_n, out=batch_offsets[1:])
+            b_slots_cpu = slot_flat_cpu[src_idx]
+            b_phis_cpu = phi_flat_cpu[src_idx]
 
-                # 构建 flat 源索引（完全向量化）
-                src_starts = offsets_np[batch_pos]  # (B,)
-                # 每个 position 重复 n 次的起始值 + 递增偏移
-                base = np.repeat(src_starts, batch_n)  # (total_in_batch,)
-                inner = np.arange(total_in_batch) - np.repeat(batch_offsets[:-1], batch_n)
-                src_indices = base + inner
+            return b_slots_cpu, b_phis_cpu, batch_n, batch_off, B, M, total
 
-                batch_slots = slot_flat_cpu[src_indices]
-                batch_phis = phi_flat_cpu[src_indices]
+        def scatter_to_gpu(b_slots_cpu, b_phis_cpu, batch_n, batch_off,
+                           B, M, total, stream=None):
+            """CPU→GPU transfer + 向量化 scatter pad。在指定 stream 上执行。"""
+            ctx = torch.cuda.stream(stream) if stream else nullcontext()
+            with ctx:
+                b_slots_gpu = b_slots_cpu.to(self.device, non_blocking=True)
+                b_phis_gpu = b_phis_cpu.to(self.device, non_blocking=True)
+                batch_n_gpu = torch.from_numpy(batch_n.copy()).to(self.device,
+                                                                   non_blocking=True)
 
-                # 一次性 CPU→GPU 传输（~几 MB，<1ms）
-                batch_slots_gpu = batch_slots.to(self.device, non_blocking=True)
-                batch_phis_gpu = batch_phis.to(self.device, non_blocking=True)
-                batch_n_gpu = torch.from_numpy(batch_n).to(self.device)
-
-                # GPU 上向量化 pad：用 arange 生成列索引
                 row_idx = torch.arange(B, device=self.device).repeat_interleave(batch_n_gpu)
-                col_offsets = torch.zeros(B + 1, dtype=torch.long, device=self.device)
-                col_offsets[1:] = batch_n_gpu.cumsum(0)
-                flat_idx = torch.arange(total_in_batch, device=self.device)
-                col_idx = flat_idx - col_offsets[:-1].repeat_interleave(batch_n_gpu)
+                col_off = torch.zeros(B + 1, dtype=torch.long, device=self.device)
+                col_off[1:] = batch_n_gpu.cumsum(0)
+                flat_idx = torch.arange(total, device=self.device)
+                col_idx = flat_idx - col_off[:-1].repeat_interleave(batch_n_gpu)
 
                 b_active = torch.zeros(B, M, dtype=torch.long, device=self.device)
                 b_phi = torch.zeros(B, M, feat_dim, dtype=torch.float32, device=self.device)
                 b_mask = torch.zeros(B, M, dtype=torch.float32, device=self.device)
 
-                b_active[row_idx, col_idx] = batch_slots_gpu
-                b_phi[row_idx, col_idx] = batch_phis_gpu
+                b_active[row_idx, col_idx] = b_slots_gpu
+                b_phi[row_idx, col_idx] = b_phis_gpu
                 b_mask[row_idx, col_idx] = 1.0
 
-                b_target = target_idx[torch.from_numpy(batch_pos).to(self.device)]
+            return b_active, b_phi, b_mask
+
+        # CUDA prefetch stream
+        from contextlib import nullcontext
+        use_prefetch = self.device.type == 'cuda'
+        prefetch_stream = torch.cuda.Stream() if use_prefetch else None
+
+        for epoch in range(epochs):
+            epoch_t0 = time.time()
+            perm = np.random.permutation(n_pos)
+            epoch_loss = 0.0
+
+            # Prefetch 第一个 batch
+            s0, e0 = 0, min(batch_size, n_pos)
+            prep0 = prepare_batch(perm[s0:e0])
+            next_batch = scatter_to_gpu(*prep0, stream=prefetch_stream)
+            next_target = target_idx[torch.from_numpy(perm[s0:e0].copy()).to(self.device)]
+
+            for bi in range(n_batches):
+                # 等待 prefetch 完成
+                if use_prefetch:
+                    torch.cuda.current_stream().wait_stream(prefetch_stream)
+                b_active, b_phi, b_mask = next_batch
+                b_target = next_target
+
+                # 启动下一个 batch 的 prefetch（和当前 batch 的 forward/backward 并行）
+                next_bi = bi + 1
+                if next_bi < n_batches:
+                    ns = next_bi * batch_size
+                    ne = min(ns + batch_size, n_pos)
+                    next_pos = perm[ns:ne]
+                    prep_next = prepare_batch(next_pos)
+                    next_batch = scatter_to_gpu(*prep_next, stream=prefetch_stream)
+                    next_target = target_idx[
+                        torch.from_numpy(next_pos.copy()).to(self.device)]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
