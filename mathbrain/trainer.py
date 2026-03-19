@@ -403,14 +403,43 @@ class MathBrainTrainer:
         print(f"  compact storage: {compact_mb:.0f}MB "
               f"(vs padded {padded_mb:.0f}MB, {compact_mb/padded_mb:.0%})")
 
-        # 紧凑数据 → GPU
-        slot_flat = data['slot_flat'].to(self.device)
-        phi_flat = data['phi_flat'].to(self.device)
-        offsets = data['offsets']  # CPU (用于 Python 索引)
-        n_active = data['n_active']  # CPU
+        # 紧凑数据（CPU）
+        slot_flat_cpu = data['slot_flat']
+        phi_flat_cpu = data['phi_flat']
+        offsets = data['offsets']
+        n_active = data['n_active']
         target_idx = data['target_idx'].to(self.device)
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
+
+        # 预构建 padded buffer（CPU 上一次性完成，避免训练循环中的 Python for）
+        max_active_global = int(n_active.max())
+        all_active = torch.zeros(n_pos, max_active_global, dtype=torch.long)
+        all_phi = torch.zeros(n_pos, max_active_global, feat_dim, dtype=torch.float32)
+        all_mask = torch.zeros(n_pos, max_active_global, dtype=torch.float32)
+
+        offsets_np = offsets.numpy()
+        for i in range(n_pos):
+            s, e = offsets_np[i], offsets_np[i + 1]
+            n = e - s
+            all_active[i, :n] = slot_flat_cpu[s:e]
+            all_phi[i, :n] = phi_flat_cpu[s:e]
+            all_mask[i, :n] = 1.0
+
+        del slot_flat_cpu, phi_flat_cpu  # 释放紧凑数据
+
+        # 尝试放 GPU
+        try:
+            all_active = all_active.to(self.device)
+            all_phi = all_phi.to(self.device)
+            all_mask = all_mask.to(self.device)
+            data_on_gpu = True
+        except RuntimeError:
+            all_active = all_active.pin_memory()
+            all_phi = all_phi.pin_memory()
+            all_mask = all_mask.pin_memory()
+            data_on_gpu = False
+            print("  [注意] padded 数据过大，使用 pinned CPU 模式")
 
         P_init = self.model.phi_encoder.P  # (D, N) numpy or None
 
@@ -464,34 +493,23 @@ class MathBrainTrainer:
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos)
+            perm = torch.randperm(n_pos, device=self.device if data_on_gpu else 'cpu')
             epoch_loss = 0.0
 
             for bi in range(n_batches):
                 s_idx = bi * batch_size
                 e_idx = min(s_idx + batch_size, n_pos)
-                batch_idx = perm[s_idx:e_idx]
-                B = len(batch_idx)
+                idx = perm[s_idx:e_idx]
 
-                # 当前 batch 的 max_active（远小于全局 max）
-                batch_n_active = n_active[batch_idx]
-                M = int(batch_n_active.max())
-
-                # 构建 padded batch（只 pad 到当前 batch 的 max）
-                b_active = torch.zeros(B, M, dtype=torch.long, device=self.device)
-                b_phi = torch.zeros(B, M, feat_dim, dtype=torch.float32, device=self.device)
-                b_mask = torch.zeros(B, M, dtype=torch.float32, device=self.device)
-
-                # 向量化填充：用 arange + 索引避免 Python for 循环
-                for j in range(B):
-                    pi = batch_idx[j].item()
-                    n = offsets[pi + 1].item() - offsets[pi].item()
-                    s = offsets[pi].item()
-                    b_active[j, :n] = slot_flat[s:s+n]
-                    b_phi[j, :n] = phi_flat[s:s+n]
-                    b_mask[j, :n] = 1.0
-
-                b_target = target_idx[batch_idx]
+                if data_on_gpu:
+                    b_active = all_active[idx]
+                    b_phi = all_phi[idx]
+                    b_mask = all_mask[idx]
+                else:
+                    b_active = all_active[idx].to(self.device, non_blocking=True)
+                    b_phi = all_phi[idx].to(self.device, non_blocking=True)
+                    b_mask = all_mask[idx].to(self.device, non_blocking=True)
+                b_target = target_idx[idx]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
