@@ -16,6 +16,39 @@ import numpy as np
 
 from .config import MathBrainConfig
 
+
+def _butterfly_matrix(D: int, N: int) -> np.ndarray:
+    """确定性 Butterfly 正交混合矩阵 (D × N)。
+
+    log2(D) 层稀疏 2×2 旋转的乘积。角度用黄金比例序列确保无对齐。
+    当 D > N 时返回 D×N 子矩阵（仍保持列正交）。
+    """
+    # D 必须是 2 的幂
+    d = D
+    if d & (d - 1) != 0:
+        # 不是 2 的幂，fallback 到 QR 分解的确定性正交矩阵
+        rng = np.random.RandomState(42)
+        Q, _ = np.linalg.qr(rng.randn(d, d))
+        return Q[:, :N]
+
+    log_d = int(np.log2(d))
+    phi_golden = (1 + np.sqrt(5)) / 2
+
+    result = np.eye(d)
+    for layer in range(log_d):
+        stride = 1 << layer
+        B = np.eye(d)
+        for i in range(0, d, 2 * stride):
+            for j in range(stride):
+                i1, i2 = i + j, i + j + stride
+                theta = np.pi * ((layer * d + i1) * phi_golden % 1)
+                c, s = np.cos(theta), np.sin(theta)
+                B[i1, i1] = c;  B[i1, i2] = -s
+                B[i2, i1] = s;  B[i2, i2] = c
+        result = B @ result
+
+    return result[:, :N]
+
 try:
     import mlx.core as mx
     HAS_MLX = True
@@ -71,8 +104,7 @@ class PhiEncoderCosineChaos:
             self.n_folds = D if n_folds < 0 else n_folds  # -1 → L=D (完整平移一圈)
             self.alpha = alpha
             sigma = cfg.PHI_SIGMA
-            rng = np.random.RandomState(42)
-            self.P = rng.randn(D, self.N).astype(np.float32) * sigma
+            self.P = _butterfly_matrix(D, self.N).astype(np.float32) * sigma
             alpha_base = (np.pi / (2 * sigma * np.sqrt(D))) * 63.5
             self.alpha_scale = (cfg.INVERSE_WEIGHT * alpha_base).astype(np.float32)
 
