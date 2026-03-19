@@ -403,26 +403,32 @@ class MathBrainTrainer:
         print(f"  compact storage: {compact_mb:.0f}MB "
               f"(vs padded {padded_mb:.0f}MB, {compact_mb/padded_mb:.0%})")
 
-        # 紧凑数据（CPU）
-        slot_flat_cpu = data['slot_flat']
-        phi_flat_cpu = data['phi_flat']
-        offsets = data['offsets']
+        # 紧凑数据 → 预 pad 成 numpy（CPU RAM，不上 GPU）
+        slot_flat_np = data['slot_flat'].numpy()
+        phi_flat_np = data['phi_flat'].numpy()
+        offsets_np = data['offsets'].numpy()
         n_active = data['n_active']
         target_idx = data['target_idx'].to(self.device)
 
         word_proj_t = torch.from_numpy(self._word_proj.T.astype(np.float32)).to(self.device)
 
-        # 预构建 per-position 索引表（避免训练循环中的 Python for）
-        # 对每个 position，生成 (row_idx, col_idx) 对，用于 scatter 到 padded batch
         max_active_global = int(n_active.max())
-        offsets_np = offsets.numpy()
+        print(f"  max_active={max_active_global}, pre-padding on CPU...")
 
-        # 预构建 padded 索引：position i 的第 j 个 slot → flat index offsets[i]+j
-        # 用于 batch 构建时的向量化 scatter
-        pos_slot_indices = []  # 每个 position 的 flat 起始索引
+        # 一次性预 pad（CPU numpy，~20-30GB for large corpus）
+        all_active = np.zeros((n_pos, max_active_global), dtype=np.int64)
+        all_phi = np.zeros((n_pos, max_active_global, feat_dim), dtype=np.float32)
+        all_mask = np.zeros((n_pos, max_active_global), dtype=np.float32)
+
         for i in range(n_pos):
-            pos_slot_indices.append((offsets_np[i], offsets_np[i+1]))
-        pos_slot_indices = np.array(pos_slot_indices, dtype=np.int64)  # (n_pos, 2)
+            s, e = offsets_np[i], offsets_np[i + 1]
+            n = e - s
+            all_active[i, :n] = slot_flat_np[s:e]
+            all_phi[i, :n] = phi_flat_np[s:e]
+            all_mask[i, :n] = 1.0
+
+        del slot_flat_np, phi_flat_np, offsets_np  # 释放紧凑数据
+        print(f"  pre-pad done: {all_phi.nbytes / 1e9:.1f}GB CPU RAM")
 
         P_init = self.model.phi_encoder.P  # (D, N) numpy or None
 
@@ -476,40 +482,19 @@ class MathBrainTrainer:
 
         for epoch in range(epochs):
             epoch_t0 = time.time()
-            perm = torch.randperm(n_pos)
+            perm = np.random.permutation(n_pos)
             epoch_loss = 0.0
 
             for bi in range(n_batches):
                 s_idx = bi * batch_size
                 e_idx = min(s_idx + batch_size, n_pos)
-                batch_idx = perm[s_idx:e_idx].numpy()
-                B = len(batch_idx)
+                idx = perm[s_idx:e_idx]
 
-                # 当前 batch 的 max_active
-                batch_ranges = pos_slot_indices[batch_idx]  # (B, 2)
-                batch_lens = batch_ranges[:, 1] - batch_ranges[:, 0]  # (B,)
-                M = int(batch_lens.max())
-
-                # 向量化构建 padded batch（CPU numpy → 一次性 to GPU）
-                b_active_np = np.zeros((B, M), dtype=np.int64)
-                b_phi_np = np.zeros((B, M, feat_dim), dtype=np.float32)
-                b_mask_np = np.zeros((B, M), dtype=np.float32)
-
-                # 用 numpy 切片填充（比 torch 快，避免 GPU 同步）
-                slot_np = slot_flat_cpu.numpy()
-                phi_np = phi_flat_cpu.numpy()
-                for j in range(B):
-                    s, e = batch_ranges[j]
-                    n = e - s
-                    b_active_np[j, :n] = slot_np[s:e]
-                    b_phi_np[j, :n] = phi_np[s:e]
-                    b_mask_np[j, :n] = 1.0
-
-                # 一次性 CPU→GPU（3 次 transfer 而不是 B*3 次）
-                b_active = torch.from_numpy(b_active_np).to(self.device, non_blocking=True)
-                b_phi = torch.from_numpy(b_phi_np).to(self.device, non_blocking=True)
-                b_mask = torch.from_numpy(b_mask_np).to(self.device, non_blocking=True)
-                b_target = target_idx[torch.from_numpy(batch_idx).to(self.device)]
+                # numpy fancy index → torch → GPU（3 次 bulk transfer）
+                b_active = torch.from_numpy(all_active[idx]).to(self.device, non_blocking=True)
+                b_phi = torch.from_numpy(all_phi[idx]).to(self.device, non_blocking=True)
+                b_mask = torch.from_numpy(all_mask[idx]).to(self.device, non_blocking=True)
+                b_target = target_idx[torch.from_numpy(idx).to(self.device)]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss = compiled_forward(b_active, b_phi, b_mask, b_target)
