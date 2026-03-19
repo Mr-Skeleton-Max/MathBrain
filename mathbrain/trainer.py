@@ -188,8 +188,8 @@ class _SleepModule(nn.Module):
 
         ctx_flat = weighted.view(B, d * D)  # view 不 copy（weighted 已连续）
 
-        # 关键 matmul 强制 fp32，防止 AMP fp16 溢出
-        slot_scores = ctx_flat.float() @ self.E_tgt.t().float()  # (B, S)
+        # Scoring: ctx → slot_scores → word_logits
+        slot_scores = ctx_flat @ self.E_tgt.t()  # (B, S)
 
         active_count = b_mask.sum(1, keepdim=True).clamp(min=1.0)
         slot_scores = slot_scores / active_count
@@ -454,7 +454,9 @@ class MathBrainTrainer:
                 alpha=self.config.CHAOS_ALPHA,
             ).to(self.device)
 
-        # 尝试 torch.compile + TF32（CUDA 有效）
+        # TF32 (CUDA only, 无精度风险)
+        if self.device.type == 'cuda':
+            torch.set_float32_matmul_precision('high')
         compiled_forward = net
         if self.device.type == 'cuda':
             torch.set_float32_matmul_precision('high')  # TF32 for matmul
@@ -471,10 +473,6 @@ class MathBrainTrainer:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_steps, eta_min=0)
 
-        # AMP (CUDA only)
-        use_amp = self.device.type == 'cuda'
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-
         best_loss = float('inf')
         best_state = None
 
@@ -489,16 +487,13 @@ class MathBrainTrainer:
                 idx = perm[s_idx:e_idx]
 
                 optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast('cuda', enabled=use_amp):
-                    loss = compiled_forward(
-                        active_local[idx], q_padded[idx],
-                        active_mask[idx], one_hot[idx])
+                loss = compiled_forward(
+                    active_local[idx], q_padded[idx],
+                    active_mask[idx], one_hot[idx])
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 scheduler.step()
 
                 epoch_loss += loss.item()
