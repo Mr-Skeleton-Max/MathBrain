@@ -1,81 +1,88 @@
 # MathBrain
 
-**Bounded-State Categorical Voting for Online Sequence Learning**
+**EMA Slot Encoding: Bounded-State Sequence Representation with O(1) Inference and No BPTT**
 
-MathBrain is an experimental sequence prediction architecture that does not store or attend over token history. Instead, it compresses all context into a bounded EMA state and predicts the next token through a cross-attention decoder — achieving O(1) inference, online learning, and full interpretability by design.
+> **TL;DR**: A parameter-free sequence encoder that compresses arbitrary-length token histories into bounded per-slot EMA states. O(1) inference like state-space models, no sequential dependency like Transformers, and mathematically proven lossless compression. Decoder-agnostic: plug in any predictor.
 
-> **TL;DR**: Transformers grow state with sequence length. MathBrain doesn't. It treats next-token prediction as a categorical voting problem over bounded-state features, with constant memory and inference cost regardless of how many tokens it has seen.
+## Core Idea
 
-## Key Ideas
-
-- **Sequence context can be rotated from "temporal horizontal" to "model vertical".** Instead of attending over token history (O(N)), MathBrain compresses context into per-slot EMA states — turning temporal information into bounded feature vectors.
-- **Per-slot independence is critical.** Each slot maintains its own EMA state independently. Independent slots enable independent voting, which tolerates compression noise.
-- **Causal slot cross-attention recovers directionality.** The latest-activated slot(s) act as query to cross-attend against all historical slots, restoring the unidirectional inductive bias lost in set-based aggregation.
-- **The EMA representation has higher information density than standard embeddings.** On the same data, EMA-encoded features achieve significantly higher training accuracy than standard Transformer embeddings, indicating richer context compression.
-- **Generalization scales super-linearly with data.** Unlike standard Transformers which show log-linear scaling, MathBrain's generalization exhibits accelerating returns with increasing data volume.
-
-## Architecture
-
-MathBrain supports two predictor backends:
-
-### Slot Cross-Attention Decoder (recommended)
+**Rotate the sequence 90°**: instead of storing a growing horizontal list of tokens, maintain a fixed vertical array of slot activation patterns.
 
 ```
-Token ──→ Retina ──→ Q: Multi-timescale EMA ──→ Slot Embedding + PE(Q) ──→ Cross-Attention Decoder ──→ LM Head
-          (word → slots)  N decay rates            E_src[slot] + FourierPE     Q=latest, K/V=history      logits
+Horizontal (Transformer/RNN):     Vertical (EMA Slot):
+t=0  t=1  t=2  ...  t=∞           slot_0: Q = [β₁^Δt, β₂^Δt, ..., β_N^Δt]
+[w₃] [w₁] [w₃] ... [w₁]    →     slot_1: Q = [β₁^Δt, β₂^Δt, ..., β_N^Δt]
+  ↑ grows forever                  slot_2: Q = [0, 0, ..., 0]  (inactive)
+                                     ↑ bounded, O(1)
 ```
 
-The cross-attention decoder implements **causal query attention**:
-1. All active slots compute embeddings: `E_src[slot_id] + PE(Q_values)`
-2. The slot(s) activated by the **latest word** are mean-pooled into a query vector
-3. All **non-latest slots** serve as keys and values
-4. Stacked cross-attention layers: `Q += CrossAttn(Q, K, V) + FFN(Q)`
-5. Final `LayerNorm → Linear` produces next-word logits
+Each slot independently tracks *when* it was activated via exponential moving averages. The resulting Q matrix is:
+- **Information-complete**: a single EMA value uniquely encodes the full activation history (proven for transcendental β)
+- **Bounded**: state size is independent of sequence length
+- **Parameter-free**: no learnable parameters in the encoder; all capacity is in the decoder
 
-This design enforces unidirectional information flow: "proposer" slots (history) cannot see the "decision maker" (latest slot), mirroring causal masking in standard autoregressive models.
+### Memory as Hallucination
 
-### Bilinear Voter (original)
+Q does not store memories. It stores the *conditions* under which a downstream decoder will reconstruct the appropriate response — more akin to context-triggered hallucination than retrieval from storage.
 
-```
-Token ──→ Hash Retina ──→  Q: Multi-timescale EMA  ──→ φ: Cosine-Chaos  ──→ Bilinear Voter
-          (n-gram → slots)   N decay rates: ρ₁..ρ_N      Map (D dims)        score = ⟨E_tgt, E_src ⊙ φ⟩
-```
+## Comparison
+
+| | Transformer | RNN/LSTM | SSM (Mamba) | **EMA Slot** |
+|---|---|---|---|---|
+| Inference | O(N²) or O(N) | **O(1)** | **O(1)** | **O(1)** |
+| Training seq. dep. | **None** | BPTT | BPTT | **None** |
+| Training memory | O(N) | O(T·H) | O(T·H) | **O(1)** |
+| Encoder params | Many | Many | Many | **Zero** |
+| Infinite context | ✗ | ✗ (truncation) | ✗ (truncation) | **✓** |
 
 ## Results
 
-### DailyDialog Language Modeling (Full dataset, ~80K sentences)
+### Memorization Capacity (Bilinear Voter, TinyStories)
 
-| Model | Params | Train Acc | Train PPL | Val Acc | Val PPL |
-|-------|--------|-----------|-----------|---------|---------|
-| **EMA SlotTransformer** | 758K | **53.3%** | **8.5** | 34.7% | 143.3 |
-| Baseline Transformer | ~750K | 39.8% | 18.9 | **34.8%** | **45.1** |
+| Corpus | Positions | Parameters | Train Acc |
+|--------|-----------|------------|-----------|
+| TinyStories 1000 | ~0.18M | ~3.5M | **99.2%** |
+| TinyStories 2000 | ~0.37M | ~4.8M | **99.2%** |
+| TinyStories 5000 | ~0.96M | ~8.1M | **99.2%** |
 
-**Key findings:**
-- **Val accuracy is on par** — EMA matches the standard Transformer on generalization accuracy
-- **Train accuracy is significantly higher** (53% vs 40%) — EMA representations carry more information
-- **Val PPL gap is a calibration issue**, not a generalization failure — the model predicts the right word equally often, but assigns overconfident probabilities when wrong
+8M parameters memorize 1M positions at 99.2% accuracy.
 
-### Data Scaling Analysis (DailyDialog, Identity Retina)
+### Generalization (Cross-Attention Decoder, DailyDialog)
 
-| Training Data | Val Acc | Val PPL | vs Baseline |
-|---------------|---------|---------|-------------|
-| 2K sentences | ~15% | 780,000 | Far below |
-| 5K sentences | 18.4% | 125,435 | Below |
-| 80K sentences | **34.7%** | **143.3** | **Matched on accuracy** |
+**80K sentences, ~758K params:**
 
-Generalization scales **super-linearly** with data volume — a property not typically seen in standard Transformers. The crossover point where EMA surpasses standard Transformers appears reachable with larger corpora.
+| Model | Train Acc | Val Acc | Val PPL |
+|-------|-----------|---------|---------|
+| **EMA SlotTransformer** | **53.3%** | 34.7% | 143.3 |
+| Baseline Transformer | 39.8% | **34.8%** | **45.1** |
 
-### TinyStories Memorization (Bilinear Voter)
+- Val accuracy matches baseline — EMA encodes enough information for equal generalization
+- Train accuracy 13.5pp higher — EMA representations are significantly richer
+- PPL gap is a calibration issue (overconfidence), not a generalization failure
 
-| Corpus | N | D | CP_RANK | Accuracy | Epoch Time |
-|--------|---|---|---------|----------|------------|
-| tinystories_10 | 4 | 8 | 384 | **99.41%** | <100ms |
-| tinystories_60 | 4 | 8 | 384 | **99.06%** | <200ms |
-| tinystories_200 | 8 | 32 | 384 | **97.13%** | ~400ms |
+**Scaling** (val acc): 1K→2K→5K→10K→80K: ~13%→16%→18%→19%→34.7% — **super-linear improvement**
+
+## Architecture
+
+```
+Token ──→ Retina ──→ EMA Encoder ──→ [Any Decoder]
+          (word→slots)  (Q: V×N matrix)
+```
+
+### Retina
+- **Identity**: 1 word = 1 slot
+- **Hash**: character n-grams → shared slot space
+
+### EMA Encoder (no learnable params)
+```
+Q_i(t+1) = β · Q_i(t) + x_i(t)     # per-slot, per-timescale
+```
+
+### Decoders (all capacity here)
+1. **Bilinear Voter**: Q → φ (nonlinear map) → bilinear scoring → slot votes
+2. **Causal Cross-Attention**: Q → PE(Q) + E_src → latest=Query, history=K/V → logits
 
 ## Quick Start
-
-### Install
 
 ```bash
 git clone https://github.com/Mr-Skeleton-Max/MathBrain.git
@@ -85,45 +92,21 @@ pip install -e .
 
 **Requirements**: Python ≥ 3.10, PyTorch ≥ 2.0 (CUDA), Triton ≥ 2.0
 
-### Train with Slot Transformer (recommended)
+### Train with Slot Transformer
 
 ```bash
-# Identity retina + SlotTransformer + causal attention
 python train_gpu.py --corpus datasets/dailydialog_utt_all_train.txt \
     --val-corpus datasets/dailydialog_utt_all_val.txt \
     --epochs 640 --transformer --d-model 64 --pe-mode linear \
     --eval-every 160 --scheduler cosine --N 64 --half-life 1 1000 \
     --retina identity
-
-# With custom EMA scales
-python train_gpu.py --corpus datasets/dailydialog_utt_5000_train.txt \
-    --val-corpus datasets/dailydialog_utt_5000_val.txt \
-    --epochs 640 --transformer --d-model 64 --pe-mode linear \
-    --eval-every 160 --scheduler cosine --N 8 --retina identity
-
-# Save model for analysis
-python train_gpu.py --corpus datasets/dailydialog_utt_all_train.txt \
-    --val-corpus datasets/dailydialog_utt_all_val.txt \
-    --epochs 640 --transformer --d-model 64 --pe-mode linear \
-    --eval-every 160 --scheduler cosine --N 64 --half-life 1 1000 \
-    --retina identity --save my_model.pt
 ```
 
-### Train with Bilinear Voter (original)
+### Train with Bilinear Voter
 
 ```bash
 python train_gpu.py --corpus datasets/tinystories_1000.txt --epochs 100
 ```
-
-### Diagnose Model Generalization
-
-```bash
-python diagnose.py --model my_model.pt \
-    --train datasets/dailydialog_utt_all_train.txt \
-    --val datasets/dailydialog_utt_all_val.txt
-```
-
-Outputs: confidence analysis, error type breakdown, per-sample prediction examples with Top-5, confusion matrix, Q-value geometry, and representation distribution analysis.
 
 ### CLI Arguments
 
@@ -137,23 +120,11 @@ Outputs: confidence analysis, error type breakdown, per-sample prediction exampl
 | `--scheduler` | constant | LR schedule: constant/cosine/step/exp |
 | `--N` | 8 | Number of EMA timescales |
 | `--half-life` | — | Half-life range for auto ρ (e.g., `1 1000`) |
-| `--retina` | hash | Retina mode: hash (n-gram) / identity (1 word=1 slot) |
+| `--retina` | hash | Retina mode: hash / identity |
 | `--transformer` | off | Use SlotTransformer decoder |
 | `--d-model` | 128 | Transformer hidden dimension |
 | `--pe-mode` | fourier | Position encoding: fourier / linear |
-| `--eval-every` | 0 | Evaluate val every N epochs |
-| `--save` | — | Save model path |
-
-## How It Differs from Transformers and SSMs
-
-| | **Transformer** | **SSM (S4/Mamba)** | **MathBrain** |
-|---|---|---|---|
-| **Context encoding** | Attend over all tokens O(N²) | Global state vector O(1) | Per-slot EMA O(V) |
-| **Inference cost** | O(N) or O(N²) | O(1) | O(V) per step |
-| **Directionality** | Causal mask | Built-in | Causal query attention |
-| **Online learning** | Requires retraining | Requires retraining | Native |
-| **Interpretability** | Post-hoc attention maps | Opaque state | Every vote traceable |
-| **Training** | BPTT through full sequence | BPTT through full sequence | Backprop in predictor only |
+| `--pred-mode` | ce | Prediction mode: ce / innovation / hybrid |
 
 ## Project Structure
 
@@ -164,30 +135,26 @@ MathBrain/
 ├── diagnose.py                     # Generalization diagnosis toolkit
 ├── MathBrain/                      # Core GPU-optimized package
 │   ├── config.py                   #   Hyperparameters
-│   ├── trainer.py                  #   GPU trainer (fit / evaluate / predict_topk)
-│   ├── slot_transformer.py         #   Cross-attention decoder with causal query
+│   ├── trainer.py                  #   GPU trainer
+│   ├── slot_transformer.py         #   Cross-attention decoder
 │   ├── retina.py                   #   Hash / Identity lexical coding
 │   ├── gpu_preprocessor.py         #   GPU batch iterator + dynamic EMA
-│   ├── streaming_preprocessor.py   #   CPU-parallel vocab builder
-│   ├── phi_encoder.py              #   Cosine-chaos feature map (CPU)
-│   ├── gpu_phi_encoder.py          #   CUDA warp-shuffle phi encoder
-│   └── triton_kernels.py           #   Triton: bilinear fwd/bwd + word_proj
+│   └── triton_kernels.py           #   Triton fused kernels
 ├── datasets/                       # DailyDialog + TinyStories subsets
-├── experiments/                    # Benchmarks and profiling scripts
 ├── paper/                          # ArXiv draft
-└── docs/                           # Mathematical specification
+└── figures/                        # φ-space diagnostic plots
 ```
 
 ## Paper
 
-> **[Bounded-State Categorical Voting for Online Sequence Learning: A White-Box Alternative to Length-Growing Black-Box Models](paper/mathbrain_arxiv_draft.pdf)**
+> **[EMA Slot Encoding: Bounded-State Sequence Representation with O(1) Inference and No Backpropagation Through Time](paper/mathbrain_arxiv_draft.pdf)**
 
 ## Citation
 
 ```bibtex
-@article{li2026mathbrain,
-  title   = {Bounded-State Categorical Voting for Online Sequence Learning:
-             A White-Box Alternative to Length-Growing Black-Box Models},
+@article{li2026ema_slot,
+  title   = {EMA Slot Encoding: Bounded-State Sequence Representation
+             with O(1) Inference and No Backpropagation Through Time},
   author  = {Li, Yuyue},
   year    = {2026}
 }

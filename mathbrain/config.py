@@ -11,6 +11,7 @@ class MathBrainConfig:
     # Hash Retina
     K: int = 65536                           # slot 总数
     NGRAM_SCALES: Tuple[int, ...] = (3,)     # n-gram 尺度
+    RETINA_MODE: str = 'hash'                # 'hash' | 'identity'
 
     # EMA
     N: int = 4                               # EMA 尺度数
@@ -26,6 +27,28 @@ class MathBrainConfig:
 
     # Bilinear 分类器
     CP_RANK: int = 384                       # 低秩分解秩
+
+    # MLP φ (替代 CosineChaos)
+    MLP_PHI_HIDDEN: int = 0                  # 0=用 chaos, >0=MLP 隐藏层维度
+
+    # MLP ctx (聚合后非线性)
+    MLP_CTX_HIDDEN: int = 0                  # 0=关, >0=ctx MLP 隐藏层维度
+
+    # Fourier φ (替代 CosineChaos)
+    FOURIER_PHI_K: int = 0                   # 0=关, >0=Fourier PE 频率数 K
+
+    # Slot Transformer decoder
+    TRANSFORMER_D_MODEL: int = 0             # 0=用原始bilinear, >0=Transformer
+    TRANSFORMER_NHEAD: int = 4
+    TRANSFORMER_LAYERS: int = 2
+    TRANSFORMER_FFN: int = 256
+    TRANSFORMER_DROPOUT: float = 0.1
+    TRANSFORMER_PE_MODE: str = 'fourier'     # 'fourier' | 'linear'
+    TRANSFORMER_Q_TRANSFORM: str = 'none'    # 'none' | 'log' | 'norm'
+    TRANSFORMER_TIE_WEIGHTS: bool = False     # True = E_src as lm_head (weight tying)
+    TRANSFORMER_PRED_MODE: str = 'ce'         # 'ce' | 'innovation' | 'hybrid'
+    INNOVATION_WEIGHT: float = 0.1            # λ for hybrid mode: CE + λ·MSE
+    VICREG_WEIGHT: float = 0.0               # 0=off, >0=anti-collapse regularization
 
     # Training
     SLEEP_LR: float = 0.01

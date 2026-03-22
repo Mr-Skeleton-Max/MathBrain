@@ -55,6 +55,11 @@ def main():
                         help='Anti-collapse (VICReg) weight, 0=off, try 0.01~1.0')
     parser.add_argument('--tie-weights', action='store_true',
                         help='Weight tying: E_src as lm_head (slot embed = output proj)')
+    parser.add_argument('--pred-mode', type=str, default='ce',
+                        choices=['ce', 'innovation', 'hybrid'],
+                        help='Prediction mode: ce | innovation (MSE) | hybrid (CE + λ·MSE)')
+    parser.add_argument('--innovation-weight', type=float, default=0.1,
+                        help='MSE innovation weight λ for hybrid mode (default 0.1)')
     parser.add_argument('--half-life', type=float, nargs=2, default=None,
                         metavar=('MIN', 'MAX'),
                         help='半衰期范围，对数均匀生成 N 个 ρ (例: --half-life 1 1000)')
@@ -134,6 +139,8 @@ def main():
             TRANSFORMER_Q_TRANSFORM=args.q_transform,
             VICREG_WEIGHT=args.vicreg,
             TRANSFORMER_TIE_WEIGHTS=args.tie_weights,
+            TRANSFORMER_PRED_MODE=args.pred_mode,
+            INNOVATION_WEIGHT=args.innovation_weight,
         )
         trainer = MathBrainTrainer(cfg, device='cuda')
 
