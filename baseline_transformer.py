@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Standard Transformer LM Baseline — 对比 MathBrain
 
-标准 word-level Transformer 语言模型:
-  word embedding + sinusoidal PE → causal Transformer → LM head → logits
+标准 Transformer 语言模型 (word-level 或 BPE):
+  token embedding + sinusoidal PE → causal Transformer → LM head → logits
 
 用法:
+  # Word-level:
   python baseline_transformer.py \
     --corpus datasets/dailydialog_utt_5000_train.txt \
     --val-corpus datasets/dailydialog_utt_5000_val.txt \
     --epochs 640 --d-model 128 --n-layers 2 --n-heads 4
+
+  # BPE:
+  python baseline_transformer.py \
+    --corpus datasets/wikitext2_train.txt \
+    --val-corpus datasets/wikitext2_validation.txt \
+    --tokenizer bpe --bpe-model tokenizers/bpe_8000.model \
+    --epochs 100 --d-model 128 --n-layers 2 --n-heads 4
 """
 
 import argparse
@@ -25,7 +33,7 @@ import torch.nn.functional as F
 # Tokenizer (简单 word-level, 与 MathBrain 对齐)
 # ═══════════════════════════════════════════════════════════════
 
-def build_vocab(sentences: List[str], min_freq: int = 1):
+def build_vocab_word(sentences: List[str], min_freq: int = 1):
     """Build word-level vocab."""
     from collections import Counter
     counter = Counter()
@@ -41,7 +49,7 @@ def build_vocab(sentences: List[str], min_freq: int = 1):
     return vocab, w2i
 
 
-def tokenize(sentence: str, w2i: dict) -> List[int]:
+def tokenize_word(sentence: str, w2i: dict) -> List[int]:
     """Tokenize a sentence to word ids."""
     unk = w2i['<unk>']
     bos = w2i['<bos>']
@@ -50,18 +58,43 @@ def tokenize(sentence: str, w2i: dict) -> List[int]:
     return tokens
 
 
-def make_dataset(sentences: List[str], w2i: dict, max_len: int = 128):
+def build_vocab_bpe(model_path: str):
+    """Build BPE vocab from sentencepiece model."""
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor()
+    sp.load(model_path)
+    V = sp.get_piece_size()
+    # pad=3, unk=0, bos=1, eos=2 (sentencepiece defaults)
+    pad_id = sp.pad_id() if sp.pad_id() >= 0 else 3
+    return sp, V, pad_id
+
+
+def tokenize_bpe(sentence: str, sp, max_len: int = 128) -> List[int]:
+    """Tokenize with BPE (sentencepiece)."""
+    bos = sp.bos_id() if sp.bos_id() >= 0 else 1
+    eos = sp.eos_id() if sp.eos_id() >= 0 else 2
+    ids = sp.encode_as_ids(sentence)
+    tokens = [bos] + ids + [eos]
+    if len(tokens) > max_len:
+        tokens = tokens[:max_len]
+    return tokens
+
+
+def make_dataset(sentences: List[str], w2i=None, sp=None, max_len: int = 128,
+                 pad_id: int = 0):
     """Create padded tensor dataset for LM training."""
     all_tokens = []
     for s in sentences:
-        toks = tokenize(s, w2i)
-        if len(toks) > max_len:
-            toks = toks[:max_len]
+        if sp is not None:
+            toks = tokenize_bpe(s, sp, max_len)
+        else:
+            toks = tokenize_word(s, w2i)
+            if len(toks) > max_len:
+                toks = toks[:max_len]
         all_tokens.append(toks)
 
     # Pad to max length in batch
     max_l = max(len(t) for t in all_tokens)
-    pad_id = w2i['<pad>']
     padded = torch.full((len(all_tokens), max_l), pad_id, dtype=torch.long)
     for i, toks in enumerate(all_tokens):
         padded[i, :len(toks)] = torch.tensor(toks, dtype=torch.long)
@@ -92,7 +125,8 @@ class StandardTransformerLM(nn.Module):
     """Standard causal Transformer language model."""
 
     def __init__(self, V: int, d_model: int = 128, nhead: int = 4,
-                 num_layers: int = 2, d_ffn: int = 256, dropout: float = 0.1):
+                 num_layers: int = 2, d_ffn: int = 256, dropout: float = 0.1,
+                 tie_weights: bool = False):
         super().__init__()
         self.d_model = d_model
 
@@ -109,8 +143,8 @@ class StandardTransformerLM(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, V, bias=False)
 
-        # Weight tying
-        self.lm_head.weight = self.embedding.weight
+        if tie_weights:
+            self.lm_head.weight = self.embedding.weight
 
         self._init_weights()
 
@@ -214,6 +248,17 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--eval-every', type=int, default=20)
+    parser.add_argument('--max-len', type=int, default=128,
+                        help='最大序列长度 (默认 128)')
+    parser.add_argument('--tokenizer', type=str, default='word',
+                        choices=['word', 'bpe'],
+                        help='分词模式: word (默认) | bpe')
+    parser.add_argument('--bpe-model', type=str, default=None,
+                        help='BPE 模型路径 (.model), 搭配 --tokenizer bpe')
+    parser.add_argument('--save', type=str, default=None,
+                        help='保存模型路径')
+    parser.add_argument('--tie-weights', action='store_true',
+                        help='共享 embedding 和 lm_head 权重 (默认关闭)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -227,15 +272,23 @@ def main():
     else:
         print(f"Train: {len(train_sents)}")
 
-    # Build vocab from training data
-    vocab, w2i = build_vocab(train_sents)
-    V = len(vocab)
-    pad_id = w2i['<pad>']
-    print(f"Vocab: {V} words")
-
-    # Tokenize
-    train_data = make_dataset(train_sents, w2i)
-    val_data = make_dataset(val_sents, w2i) if val_sents else None
+    # Build vocab & tokenize
+    sp = None
+    w2i = None
+    if args.tokenizer == 'bpe':
+        if args.bpe_model is None:
+            raise ValueError("--bpe-model required with --tokenizer bpe")
+        sp, V, pad_id = build_vocab_bpe(args.bpe_model)
+        print(f"Tokenizer: BPE (sentencepiece, vocab={V})")
+        train_data = make_dataset(train_sents, sp=sp, max_len=args.max_len, pad_id=pad_id)
+        val_data = make_dataset(val_sents, sp=sp, max_len=args.max_len, pad_id=pad_id) if val_sents else None
+    else:
+        vocab, w2i = build_vocab_word(train_sents)
+        V = len(vocab)
+        pad_id = w2i['<pad>']
+        print(f"Tokenizer: word-level (vocab={V})")
+        train_data = make_dataset(train_sents, w2i=w2i, max_len=args.max_len, pad_id=pad_id)
+        val_data = make_dataset(val_sents, w2i=w2i, max_len=args.max_len, pad_id=pad_id) if val_sents else None
 
     total_train_tokens = (train_data != pad_id).sum().item()
     print(f"Train tokens: {total_train_tokens:,}")
@@ -247,12 +300,13 @@ def main():
     model = StandardTransformerLM(
         V=V, d_model=args.d_model, nhead=args.n_heads,
         num_layers=args.n_layers, d_ffn=args.d_ffn,
-        dropout=args.dropout,
+        dropout=args.dropout, tie_weights=args.tie_weights,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
+    tied_str = ', tie-weights' if args.tie_weights else ''
     print(f"\nModel: d_model={args.d_model}, layers={args.n_layers}, "
-          f"heads={args.n_heads}, params={n_params:,}")
+          f"heads={args.n_heads}, params={n_params:,}{tied_str}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -290,6 +344,14 @@ def main():
         val_res = evaluate(model, val_data, pad_id, device)
         print(f"  Val:   acc={val_res['acc']:.1f}%, ppl={val_res['ppl']:.1f}")
         print(f"  Best Val PPL: {best_val_ppl:.1f}")
+
+    if args.save:
+        torch.save({
+            'model': model.state_dict(),
+            'args': vars(args),
+            'vocab_size': V,
+        }, args.save)
+        print(f"\nModel saved to {args.save}")
 
 
 if __name__ == '__main__':

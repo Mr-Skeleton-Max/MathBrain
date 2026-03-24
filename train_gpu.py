@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from MathBrain.config import MathBrainConfig
 from MathBrain.trainer import MathBrainTrainer
+from MathBrain.data import BPETokenizer, set_tokenizer
 
 
 def main():
@@ -49,8 +50,8 @@ def main():
                         help='每 N epoch 评估 val (0=仅结束时)')
     parser.add_argument('--N', type=int, default=8)
     parser.add_argument('--retina', type=str, default='hash',
-                        choices=['hash', 'identity'],
-                        help='Retina 模式: hash (n-gram) | identity (1 word=1 slot)')
+                        choices=['hash', 'identity', 'bpe'],
+                        help='Retina 模式: hash (n-gram) | identity (1 word=1 slot) | bpe (1 BPE token=1 slot)')
     parser.add_argument('--vicreg', type=float, default=0.0,
                         help='Anti-collapse (VICReg) weight, 0=off, try 0.01~1.0')
     parser.add_argument('--tie-weights', action='store_true',
@@ -98,6 +99,11 @@ def main():
     parser.add_argument('--resume', type=str, default=None,
                         help='从 checkpoint 加载继续训练')
     parser.add_argument('--save', type=str, help='保存模型路径')
+    parser.add_argument('--tokenizer', type=str, default='word',
+                        choices=['word', 'bpe'],
+                        help='分词模式: word (默认) | bpe (GPT-2 BPE)')
+    parser.add_argument('--bpe-model', type=str, default=None,
+                        help='BPE 模型路径 (.model), 搭配 --tokenizer bpe 使用')
     args = parser.parse_args()
 
     corpus = [l.strip() for l in open(args.corpus) if l.strip()]
@@ -105,6 +111,16 @@ def main():
     if args.val_corpus:
         val_corpus_ext = [l.strip() for l in open(args.val_corpus) if l.strip()]
         print(f"Train: {len(corpus)}, Val: {len(val_corpus_ext)} (from {args.val_corpus})")
+
+    # Setup tokenizer
+    if args.tokenizer == 'bpe':
+        bpe_tok = BPETokenizer(model_path=args.bpe_model)
+        set_tokenizer(bpe_tok)
+        args.retina = 'bpe'  # BPE: 1 token = 1 slot, no hash
+        print(f"Tokenizer: BPE ({bpe_tok.backend}, vocab={bpe_tok.vocab_size})")
+    else:
+        set_tokenizer(None)
+        print("Tokenizer: word-level")
 
     if args.resume:
         # Resume: load checkpoint, config comes from checkpoint
@@ -153,7 +169,9 @@ def main():
         warmup_pct=args.warmup_pct,
         scheduler=args.scheduler,
         noise_sigma=args.noise_sigma,
-        val_split=args.val_split if not val_corpus_ext else 0.0,
+        val_split=(args.val_split if args.val_split > 0
+                   else (0.1 if args.eval_every > 0 and not val_corpus_ext else 0.0)
+                   ) if not val_corpus_ext else 0.0,
         val_corpus_ext=val_corpus_ext,
         phi_residual=args.residual,
         weight_decay=args.weight_decay,
