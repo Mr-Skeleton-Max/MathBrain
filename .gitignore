@@ -61,3 +61,11 @@ EXP/
 
 # Conversation exports
 2026-*.txt
+
+# Paper - only keep main draft
+paper/Encoder.pdf
+paper/diff.pdf
+paper/claims_faq.*
+paper/mathbrain_diff.*
+paper/response_letter.*
+paper/question_going_to_fuck.md
