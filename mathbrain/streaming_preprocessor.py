@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from .config import MathBrainConfig
-from .retina import HashRetina
+from .retina import HashRetina, IdentityRetina, BPERetina
 from .data import tokenize
 
 
@@ -39,7 +39,7 @@ class VocabInfo:
     wp_slot_weights: np.ndarray
 
 
-def build_vocab(corpus: List[str], retina: HashRetina, *,
+def build_vocab(corpus: List[str], retina, *,
                 verbose=True) -> VocabInfo:
     t0 = time.time()
     word_to_slots: Dict[str, np.ndarray] = {}
@@ -96,7 +96,12 @@ _w_wti = None
 def _worker_init(config_dict, slot_to_compact, word_to_idx):
     global _w_retina, _w_rho, _w_N, _w_eps_q, _w_stc, _w_wti
     cfg = MathBrainConfig(**config_dict)
-    _w_retina = HashRetina(cfg)
+    if cfg.RETINA_MODE == 'identity':
+        _w_retina = IdentityRetina(cfg)
+    elif cfg.RETINA_MODE == 'bpe':
+        _w_retina = BPERetina(cfg)
+    else:
+        _w_retina = HashRetina(cfg)
     _w_rho = cfg.rho
     _w_N = cfg.N
     _w_eps_q = float(cfg.EPS_Q)
@@ -192,6 +197,7 @@ def preprocess_once(corpus: List[str], vocab: VocabInfo,
         'PHI_SIGMA': float(config.PHI_SIGMA),
         'CHAOS_N_FOLDS': int(config.CHAOS_N_FOLDS),
         'CHAOS_ALPHA': float(config.CHAOS_ALPHA),
+        'RETINA_MODE': config.RETINA_MODE,
     }
 
     t0 = time.time()

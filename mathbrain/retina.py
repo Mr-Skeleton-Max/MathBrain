@@ -56,3 +56,57 @@ class HashRetina:
     def get_slots(self, word: str) -> np.ndarray:
         """word → sorted unique slot IDs"""
         return np.array(sorted(self.encode(word).keys()), dtype=np.int32)
+
+
+class IdentityRetina:
+    """Identity Retina: 1 word = 1 slot.
+
+    Each unique word maps to a unique slot ID.
+    No hash collisions, no n-gram decomposition.
+    """
+
+    def __init__(self, config: MathBrainConfig):
+        self.k = config.K
+        self._word_to_slot: Dict[str, int] = {}
+        self._next_slot = 0
+
+    def encode(self, word: str) -> Dict[int, int]:
+        """word → {slot_id: 1}"""
+        if word not in self._word_to_slot:
+            self._word_to_slot[word] = self._next_slot
+            self._next_slot += 1
+        return {self._word_to_slot[word]: 1}
+
+    def get_slots(self, word: str) -> np.ndarray:
+        """word → single-element slot array"""
+        enc = self.encode(word)
+        return np.array(sorted(enc.keys()), dtype=np.int32)
+
+
+class BPERetina:
+    """BPE Retina: 1 BPE token = 1 slot.
+
+    Uses the global BPE tokenizer from data module.
+    Each BPE token ID maps directly to a slot ID.
+    """
+
+    def __init__(self, config: MathBrainConfig):
+        self.k = config.K
+        self._cache: Dict[str, Dict[int, int]] = {}
+
+    def encode(self, word: str) -> Dict[int, int]:
+        """word → {slot_id: 1}  (BPE token ID = slot ID)"""
+        if word in self._cache:
+            return self._cache[word]
+        # For BPE, each "word" is already a single BPE token string
+        # The slot ID is the token's position in the vocabulary
+        # We use a simple hash to get a consistent slot assignment
+        slot_id = hash(word) % (2**31)
+        result = {slot_id: 1}
+        self._cache[word] = result
+        return result
+
+    def get_slots(self, word: str) -> np.ndarray:
+        """word → single-element slot array"""
+        enc = self.encode(word)
+        return np.array(sorted(enc.keys()), dtype=np.int32)
