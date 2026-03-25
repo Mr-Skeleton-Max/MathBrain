@@ -37,7 +37,7 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-def compute_ema(x: torch.Tensor, rho: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
+def compute_ema(x: torch.Tensor, rho: torch.Tensor, chunk_size: int = 4096, init_state: torch.Tensor = None) -> (torch.Tensor, torch.Tensor):
     """
     Compute EMA across the sequence using Triton parallel scan.
     
@@ -48,6 +48,7 @@ def compute_ema(x: torch.Tensor, rho: torch.Tensor, chunk_size: int = 4096) -> t
         
     Returns:
         Q: (B, T, S, N) float32 tensor of memory states.
+        carry: (B, S, N) float32 tensor of the final step's memory state.
     """
     assert x.is_contiguous(), "x must be contiguous"
     B, T, S = x.shape
@@ -57,13 +58,13 @@ def compute_ema(x: torch.Tensor, rho: torch.Tensor, chunk_size: int = 4096) -> t
 
     if not HAS_TRITON or x.device.type != 'cuda':
         # CPU/MPS Fallback using simple loop
-        q_prev = torch.zeros(B, S, N, device=x.device, dtype=torch.float32)
+        q_prev = init_state.clone() if init_state is not None else torch.zeros(B, S, N, device=x.device, dtype=torch.float32)
         rho_exp = rho.view(1, 1, N)
         for t in range(T):
             q_t = q_prev * rho_exp + x.select(1, t).unsqueeze(-1)
             Q[:, t, :, :] = q_t
             q_prev = q_t
-        return Q
+        return Q, q_prev
 
     if T <= chunk_size:
         BLOCK_T = triton.next_power_of_2(T)
@@ -74,9 +75,16 @@ def compute_ema(x: torch.Tensor, rho: torch.Tensor, chunk_size: int = 4096) -> t
             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
             T, S, N, BLOCK_T=BLOCK_T,
         )
+        
+        if init_state is not None:
+            t_indices = torch.arange(1, T + 1, device=x.device, dtype=torch.float32)
+            rho_powers = rho.unsqueeze(0).pow(t_indices.unsqueeze(1))
+            Q += init_state.unsqueeze(1) * rho_powers.transpose(0, 1).unsqueeze(0).unsqueeze(2)
+            
+        return Q, Q[:, -1, :, :].clone()
     else:
         # Fallback for extreme lengths: chunked with carry-over
-        carry = torch.zeros(B, S, N, device=x.device, dtype=torch.float32)
+        carry = init_state.clone() if init_state is not None else torch.zeros(B, S, N, device=x.device, dtype=torch.float32)
         BLOCK_T = triton.next_power_of_2(chunk_size)
         grid = (B * S * N,)
 
@@ -105,4 +113,4 @@ def compute_ema(x: torch.Tensor, rho: torch.Tensor, chunk_size: int = 4096) -> t
             Q[:, t_start:t_end] = Q_chunk
             carry = Q[:, t_end - 1, :, :].clone()
 
-    return Q
+    return Q, carry

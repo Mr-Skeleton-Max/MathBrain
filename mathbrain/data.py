@@ -2,25 +2,36 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import List
 
-class LMDataset(Dataset):
+class PrecomputedEMADataset(Dataset):
     """
-    Language Modeling Dataset for MathBrain.
-    Chunks the input token IDs into fixed-length sequences.
+    Loads precomputed EMA states and target tokens.
+    It yields sequences of length `seq_len` to parallelize Decoder training,
+    but crucially, since Q_active is already precomputed across the whole corpus,
+    these chunks carry INFINITE historical context and can be safely SHUFFLED.
     """
-    def __init__(self, token_ids: List[int], seq_len: int = 256):
+    def __init__(self, pt_path: str, seq_len: int = 256):
         self.seq_len = seq_len
-        # Drop the remainder that doesn't fit exactly into seq_len
-        n_seqs = (len(token_ids) - 1) // seq_len
-        self.n_seqs = n_seqs
+        print(f"Loading precomputed dataset from {pt_path} ...")
+        data = torch.load(pt_path, map_location='cpu')
         
-        # Avoid zero length for tiny datasets
-        if n_seqs == 0 and len(token_ids) > 1:
+        # Load tensors
+        self.q_active = data['q_active']            # (Total, max_active, N)
+        self.slot_indices = data['slot_indices']    # (Total, max_active)
+        self.pad_mask = data['pad_mask']            # (Total, max_active)
+        self.q_query = data['q_query']              # (Total, 1, N)
+        self.idx_query = data['idx_query']          # (Total, 1)
+        self.targets = data['targets']              # (Total,)
+        
+        self.total_tokens = self.targets.shape[0]
+        self.n_seqs = self.total_tokens // seq_len
+        
+        # In rare cases of tiny datasets
+        if self.n_seqs == 0 and self.total_tokens > 0:
             self.n_seqs = 1
-            self.seq_len = len(token_ids) - 1
-            self.token_ids = token_ids
-        else:
-            self.token_ids = token_ids[:n_seqs * seq_len + 1]
-            
+            self.seq_len = self.total_tokens
+        
+        print(f"Loaded {self.total_tokens} tokens. Using seq_len={self.seq_len} -> {self.n_seqs} sequences.")
+
     def __len__(self):
         return self.n_seqs
 
@@ -28,10 +39,17 @@ class LMDataset(Dataset):
         start = idx * self.seq_len
         end = start + self.seq_len
         
-        x = torch.tensor(self.token_ids[start:end], dtype=torch.long)
-        y = torch.tensor(self.token_ids[start+1:end+1], dtype=torch.long)
-        return x, y
+        # We return the precomputed features for this chunk.
+        # Since they were precomputed WITHOUT chunk slicing, they retain full history!
+        return {
+            'q_active': self.q_active[start:end].to(torch.float32),
+            'slot_indices': self.slot_indices[start:end].to(torch.long),
+            'pad_mask': self.pad_mask[start:end],
+            'q_query': self.q_query[start:end].to(torch.float32),
+            'idx_query': self.idx_query[start:end].to(torch.long),
+            'targets': self.targets[start:end].to(torch.long)
+        }
 
-def get_dataloader(token_ids: List[int], batch_size: int, seq_len: int = 256, shuffle: bool = True):
-    dataset = LMDataset(token_ids, seq_len=seq_len)
+def get_precomputed_dataloader(pt_path: str, batch_size: int, seq_len: int = 256, shuffle: bool = True):
+    dataset = PrecomputedEMADataset(pt_path, seq_len=seq_len)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0, pin_memory=True)
