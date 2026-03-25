@@ -30,7 +30,7 @@ def extract_active_slots(Q: torch.Tensor, eps_q: float) -> Tuple[torch.Tensor, t
     expanded_indices = sorted_indices.unsqueeze(-1).expand(-1, -1, N)
     Q_active = torch.gather(Q, 1, expanded_indices) # (BT, max_active, N)
 
-    return Q_active, pad_mask
+    return Q_active, sorted_indices, pad_mask
 
 class MathBrainTrainer:
     def __init__(self, config: MathBrainConfig, device: str = None):
@@ -67,11 +67,19 @@ class MathBrainTrainer:
         
         # 3. Flatten and Extract Active Slots
         Q_flat = Q.view(B * T, V, self.config.N)
-        Q_active, pad_mask = extract_active_slots(Q_flat, self.eps_q)
+        Q_active, slot_indices, pad_mask = extract_active_slots(Q_flat, self.eps_q)
+        
+        # Construct Query from latest tokens
+        idx_query = x.to(self.device).view(B * T)
+        # Gather Q values for the latest tokens
+        q_query = Q_flat[torch.arange(B * T, device=self.device), idx_query]
+        
+        # Reshape for decoder
+        idx_query = idx_query.unsqueeze(1) # (BT, 1)
+        q_query = q_query.unsqueeze(1)     # (BT, 1, N)
         
         # 4. Decoder Prediction
-        # Q_active: (BT, max_active, N) -> logits: (BT, V)
-        logits = self.decoder(Q_active, pad_mask)
+        logits = self.decoder(Q_active, slot_indices, pad_mask, q_query, idx_query)
         
         # 5. Loss
         y_flat = y.to(self.device).view(-1)
@@ -97,8 +105,14 @@ class MathBrainTrainer:
             x_onehot = F.one_hot(x, num_classes=V).to(self.device, dtype=torch.float32)
             Q = compute_ema(x_onehot, self.rho)
             Q_flat = Q.view(B * T, V, self.config.N)
-            Q_active, pad_mask = extract_active_slots(Q_flat, self.eps_q)
-            logits = self.decoder(Q_active, pad_mask)
+            Q_active, slot_indices, pad_mask = extract_active_slots(Q_flat, self.eps_q)
+            
+            idx_query = x.to(self.device).view(B * T)
+            q_query = Q_flat[torch.arange(B * T, device=self.device), idx_query]
+            idx_query = idx_query.unsqueeze(1)
+            q_query = q_query.unsqueeze(1)
+            
+            logits = self.decoder(Q_active, slot_indices, pad_mask, q_query, idx_query)
             
             y_flat = y.to(self.device).view(-1)
             loss = F.cross_entropy(logits, y_flat, reduction='sum')

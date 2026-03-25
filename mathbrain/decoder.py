@@ -30,34 +30,31 @@ class FourierEncoding(nn.Module):
 
 
 class SlotTransformer(nn.Module):
-    """
+    '''
     MathBrain Decoder: Cross-Attention from Current Token to Active Slots.
     Treats the incoming token as Query, and the active EMA slots as Key/Values.
-    """
+    '''
     def __init__(self, config: MathBrainConfig):
         super().__init__()
         self.config = config
         
-        # 1. Embeddings
-        self.word_embed = nn.Embedding(config.vocab_size, config.d_model)
+        # 1. Embeddings (E_src)
+        self.slot_embed = nn.Embedding(config.vocab_size, config.d_model)
         
-        # 2. Phi Encoder (maps raw N timescales to d_model)
+        # 2. Positional Encoding (PE) from Q values
         if config.phi_mode == 'linear':
-            self.phi_encoder = nn.Linear(config.N, config.d_model)
+            self.pe_proj = nn.Linear(config.N, config.d_model)
         elif config.phi_mode == 'fourier':
-            self.phi_encoder = FourierEncoding(config.N, config.d_model, K=8)
+            self.pe_proj = FourierEncoding(config.N, config.d_model, K=8)
         else:
-            self.phi_encoder = nn.Sequential(
+            self.pe_proj = nn.Sequential(
                 nn.Linear(config.N, config.d_model),
                 nn.GELU(),
                 nn.Linear(config.d_model, config.d_model)
             )
 
-        # 3. Transformer Decoder Layers (Cross Attention only, no self-seq-attention)
-        # We only attend from the current active Q vector to other active Q vectors. 
-        # Actually in MathBrain, the slots ARE the sequence! 
-        # So we run standard self-attention over the active slots, then pool.
-        encoder_layer = nn.TransformerEncoderLayer(
+        # 3. Transformer Decoder Layers (Cross Attention)
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=config.d_model,
             nhead=config.n_heads,
             dim_feedforward=config.d_ff,
@@ -65,35 +62,38 @@ class SlotTransformer(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.n_layers)
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=config.n_layers)
         
-        # 4. Global pooling & Output mapping
+        # 4. Output mapping
         self.final_ln = nn.LayerNorm(config.d_model)
         self.output_proj = nn.Linear(config.d_model, config.vocab_size, bias=False)
         
         if config.tie_weights:
-            self.output_proj.weight = self.word_embed.weight
+            self.output_proj.weight = self.slot_embed.weight
 
-    def forward(self, q_active: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
-        """
-        q_active: (B, max_active, N)  - The EMA values for active slots
-        pad_mask: (B, max_active)     - True for padding (ignored) slots, False for valid
-        """
-        # Encode Q to rich features (B, max_active, D)
-        features = self.phi_encoder(q_active)
+    def forward(self, q_active: torch.Tensor, slot_indices: torch.Tensor, pad_mask: torch.Tensor, 
+                q_query: torch.Tensor, idx_query: torch.Tensor) -> torch.Tensor:
+        '''
+        q_active: (B*T, max_active, N)
+        slot_indices: (B*T, max_active)
+        pad_mask: (B*T, max_active)
+        q_query: (B*T, 1, N)
+        idx_query: (B*T, 1)
+        '''
+        # Keys / Values: E_src[slot_i] + PE(Q_i)
+        kv_emb = self.slot_embed(slot_indices) # (B*T, max_active, D)
+        kv_pe = self.pe_proj(q_active)         # (B*T, max_active, D)
+        memory = kv_emb + kv_pe
         
-        # Self-attention over active slots
-        # PyTorch TransformerEncoder expects src_key_padding_mask where True = ignore
-        attended = self.transformer(features, src_key_padding_mask=pad_mask)
+        # Query: E_src[latest_slot] + PE(Q_latest)
+        q_emb = self.slot_embed(idx_query)     # (B*T, 1, D)
+        q_pe = self.pe_proj(q_query)           # (B*T, 1, D)
+        query = q_emb + q_pe
         
-        # Global aggregation (mean pooling over valid active slots)
-        # Inverse mask: True for valid slots
-        valid_mask = (~pad_mask).unsqueeze(-1).to(attended.dtype)
-        sum_features = (attended * valid_mask).sum(dim=1)
-        valid_counts = valid_mask.sum(dim=1).clamp_min(1.0)
-        pooled = sum_features / valid_counts
+        # Cross-attention (tgt=query, memory=KV)
+        attended = self.transformer(tgt=query, memory=memory, memory_key_padding_mask=pad_mask)
         
-        # Final norm and linear
-        x = self.final_ln(pooled)
+        # Output formulation
+        x = self.final_ln(attended.squeeze(1)) # (B*T, D)
         logits = self.output_proj(x)
         return logits
