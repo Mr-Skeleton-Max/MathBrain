@@ -16,12 +16,7 @@ class MathBrainConfig:
     rho: Tuple[float, ...] = (0.3, 0.75, 0.93, 0.98, 0.995, 0.999, 0.9995, 0.9999)
     eps_q: float = 1e-6       # Dead slot threshold (if Q < eps_q, slot is ignored)
     
-    # ── Phi Projection ──
-    # We map raw Q (N dimensions) to a richer feature space
-    d_phi: int = 32
-    phi_alpha: float = 2.1    # Scaling factor for CosineChaos (if used)
-    phi_mode: str = 'linear'  # 'linear', 'cosine', or 'mlp'
-    
+
     # ── Decoder (Slot Transformer) ──
     d_model: int = 128
     n_layers: int = 2
