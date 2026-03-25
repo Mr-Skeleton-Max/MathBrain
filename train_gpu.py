@@ -20,9 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from MathBrain.config import MathBrainConfig
-from MathBrain.trainer import MathBrainTrainer
-from MathBrain.data import BPETokenizer, set_tokenizer
+from mathbrain.config import MathBrainConfig
+from mathbrain.trainer import MathBrainTrainer
+from mathbrain.data import BPETokenizer, set_tokenizer
 
 
 def main():

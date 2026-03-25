@@ -18,11 +18,11 @@ from collections import defaultdict
 
 # Add project root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from MathBrain.config import MathBrainConfig
-from MathBrain.trainer import MathBrainTrainer
-from MathBrain.data import tokenize
-from MathBrain.gpu_preprocessor import gpu_preprocess, iter_batches_gpu
-from MathBrain.slot_transformer import flat_to_padded
+from mathbrain.config import MathBrainConfig
+from mathbrain.trainer import MathBrainTrainer
+from mathbrain.data import tokenize
+from mathbrain.gpu_preprocessor import gpu_preprocess, iter_batches_gpu
+from mathbrain.slot_transformer import flat_to_padded
 
 
 def load_model_and_data(model_path, train_file, val_file, device='cuda'):
