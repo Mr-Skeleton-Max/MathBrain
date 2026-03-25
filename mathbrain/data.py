@@ -38,6 +38,46 @@ def tokenize(sentence: str) -> List[str]:
 
 
 # =====================================================================
+# BPE Tokenizer
+# =====================================================================
+
+_global_tokenizer = None
+
+
+class BPETokenizer:
+    """BPE tokenizer wrapper (sentencepiece backend)."""
+
+    def __init__(self, model_path: str = None):
+        self._model_path = model_path
+        import sentencepiece as spm
+        self._sp = spm.SentencePieceProcessor()
+        self._sp.Load(model_path)
+        self.backend = 'sentencepiece'
+        self.vocab_size = self._sp.GetPieceSize()
+
+    def tokenize(self, text: str) -> List[str]:
+        return self._sp.EncodeAsPieces(text.lower())
+
+
+def set_tokenizer(tok):
+    """Set global tokenizer (None = word-level)."""
+    global _global_tokenizer
+    _global_tokenizer = tok
+
+
+def get_tokenizer():
+    """Get current global tokenizer."""
+    return _global_tokenizer
+
+
+def tokenize_auto(sentence: str) -> List[str]:
+    """Tokenize using global tokenizer (BPE if set, else word-level)."""
+    if _global_tokenizer is not None:
+        return _global_tokenizer.tokenize(sentence)
+    return tokenize(sentence)
+
+
+# =====================================================================
 # 预处理
 # =====================================================================
 

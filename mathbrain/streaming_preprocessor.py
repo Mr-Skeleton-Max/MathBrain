@@ -19,7 +19,7 @@ import torch
 
 from .config import MathBrainConfig
 from .retina import HashRetina, IdentityRetina, BPERetina
-from .data import tokenize
+from .data import tokenize_auto
 
 
 # =====================================================================
@@ -45,7 +45,7 @@ def build_vocab(corpus: List[str], retina, *,
     word_to_slots: Dict[str, np.ndarray] = {}
     all_slots = set()
     for s in corpus:
-        for w in tokenize(s):
+        for w in tokenize_auto(s):
             if w not in word_to_slots:
                 slots = retina.get_slots(w)
                 word_to_slots[w] = slots
@@ -116,7 +116,7 @@ def _worker_process(sentences):
     slots_parts, Q_parts, targets, counts = [], [], [], []
 
     for s in sentences:
-        words = tokenize(s)
+        words = tokenize_auto(s)
         if len(words) < 2:
             continue
         encoded = [retina.encode(w) for w in words]
