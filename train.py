@@ -56,14 +56,15 @@ def main():
     else:
         vocab_size = args.vocab
 
+    # Match paper's exact hyperparams for WikiText-2:
+    # d_model=64, n_layers=2, n_heads=8, N=64, half_life=1..1000
     cfg = MathBrainConfig(
         vocab_size=vocab_size,
         retina_mode=retina_mode,
-        N=8,
-        # Default architecture from the clean rewrite
-        d_model=128,
+        N=64,
+        d_model=64,
         n_layers=2,
-        n_heads=4,
+        n_heads=8,
         d_ff=256,
         phi_mode='linear'
     )

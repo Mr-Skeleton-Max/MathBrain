@@ -125,6 +125,11 @@ class MathBrainTrainer:
     def fit(self, train_loader, val_loader=None, epochs: int = 5):
         print(f"Params: {sum(p.numel() for p in self.decoder.parameters()):,}")
         
+        # Scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=epochs * len(train_loader), eta_min=1e-5
+        )
+        
         for epoch in range(epochs):
             t0 = time.time()
             train_loss = 0.0
@@ -132,16 +137,20 @@ class MathBrainTrainer:
             for step, (x, y) in enumerate(train_loader):
                 loss = self.train_step(x, y)
                 train_loss += loss
+                scheduler.step()
                 
-                if step % 20 == 0:
+                if step % 100 == 0:
                     dt = (time.time() - t0) * 1000 / (step + 1)
-                    print(f"Epoch {epoch} | Step {step} | Loss: {loss:.4f} | {dt:.1f}ms / batch")
+                    lr = scheduler.get_last_lr()[0]
+                    print(f"Epoch {epoch} | Step {step} | Loss: {loss:.4f} | LR: {lr:.2e} | {dt:.1f}ms / batch")
                     
             train_loss /= len(train_loader)
+            train_ppl = math.exp(min(train_loss, 20.0))
+            
             val_str = ""
             if val_loader:
                 val_loss = self.evaluate(val_loader)
                 val_ppl = math.exp(min(val_loss, 20.0))
                 val_str = f"| Val Loss: {val_loss:.4f} | Val PPL: {val_ppl:.2f}"
                 
-            print(f"=== Epoch {epoch} | Train Loss: {train_loss:.4f} {val_str} ===")
+            print(f"=== Epoch {epoch} | Train Loss: {train_loss:.4f} | Train PPL: {train_ppl:.2f} {val_str} ===")
