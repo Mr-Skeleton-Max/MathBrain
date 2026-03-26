@@ -15,6 +15,9 @@ class MathBrainConfig:
     # Rho values can be configured manually or generated via half-lives
     rho: Tuple[float, ...] = (0.3, 0.75, 0.93, 0.98, 0.995, 0.999, 0.9995, 0.9999)
     eps_q: float = 1e-6       # Dead slot threshold (if Q < eps_q, slot is ignored)
+    max_active_slots: int = 64 # Hard cap on active slots fed to the decoder
+                               # Without this, long-timescale rho≈1 keeps ALL slots
+                               # active indefinitely → k grows to vocab_size → OOM.
     
 
     # ── Decoder (Slot Transformer) ──
