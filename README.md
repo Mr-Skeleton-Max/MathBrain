@@ -1,207 +1,149 @@
-# EMA Slot Encoding
+# Per-Slot EMA: Compress Time, Not Semantics
 
-**A Parameter-Free Sequence Context Encoder with O(1) Inference and No Backpropagation Through Time**
-
-[![Paper](https://img.shields.io/badge/Paper-PDF-blue)](paper/mathbrain_arxiv_draft.pdf)
-[![License](https://img.shields.io/badge/License-Apache_2.0-green)](LICENSE)
+**A BPTT-free, O(1)-state sequence model that matches RoPE Transformers on standard benchmarks.**
 
 ---
 
 ## What is this?
 
-A new way to encode sequence history for language modeling. Instead of storing a growing list of past tokens (Transformer KV cache) or compressing everything into a learned hidden state (RNN/SSM), we maintain a **fixed-size matrix** where each row is a vocabulary slot and each column is an EMA timescale.
+Per-Slot EMA is a new approach to sequence modeling that replaces the KV cache (Transformer) or learned hidden state (RNN/SSM) with a fixed-size matrix of exponential moving average counters — one per vocabulary token, tracking *when* each token appeared, not *what* it means.
 
 ```
-Standard approach:                    EMA Slot approach:
-                                      
-  Sequence grows → cost grows           Vocabulary slots (fixed)
-  [t=0][t=1][t=2]...[t=T]  O(T)        slot "the":  Q = [0.82, 0.35, 0.12, ...]
-                                        slot "cat":  Q = [0.91, 0.67, 0.44, ...]
-                                        slot "sat":  Q = [0.00, 0.00, 0.00, ...]  (never seen)
-                                        ↑ size = V × N, independent of T
+Transformer KV Cache:              Per-Slot EMA:
+  Stores d-dim vectors per pos       Stores N-dim EMA per vocab slot
+  Size: O(T × d), grows with T      Size: O(V × N), constant
+  Needs BPTT for training            No BPTT — pure analytic update
+  
+  [K₁,V₁][K₂,V₂]...[K_T,V_T]      slot "the":  C = [0.82, 0.35, ...]
+                                     slot "cat":  C = [0.91, 0.67, ...]
+                                     slot "sat":  C = [0.00, 0.00, ...]
 ```
 
-**Core insight**: when a token appears, its slot's EMA state gets a `+1` impulse and decays over time. With multiple decay rates (timescales), the resulting vector uniquely fingerprints the token's *entire activation history* — when it appeared, how often, how recently.
+**Core idea**: Each time step writes a 1-bit signal ("which token appeared") instead of a d-dimensional semantic vector. Semantics are generated *on demand* at prediction time (Late Semantic Binding) by a Transformer decoder that combines the static word embeddings with EMA temporal statistics.
+
+## Key Results (WikiText-103, 46M params)
+
+| Model | seq_len | Val PPL | Train PPL |
+|-------|---------|---------|-----------|
+| **Per-Slot EMA** | 512 | **23.4** | **18.6** |
+| RoPE Transformer | 2048 | 24.2 | 22.6 |
+| RoPE Transformer | 4096 | 22.0 | 19.9 |
+
+- EMA@512 **outperforms** RoPE@2048 — because c_base provides full document context regardless of seq_len
+- EMA's train PPL is the **lowest across all configurations** — its orthogonal slot design eliminates inter-token information competition
+- RoPE needs 8x compute (seq_len=4096) to surpass EMA
 
 ## Key Properties
 
-| Property | How | Proven? |
-|----------|-----|---------|
-| **O(1) inference** w.r.t. sequence length T | Encoder update is constant per step; decoder attends over active slots (bounded by vocab size V, a constant) | ✅ By construction + Zipf saturation |
-| **Mathematically lossless** under exact arithmetic | Theorem 1: for transcendental β and binary activations, distinct histories → distinct EMA values | ✅ Number-theoretic proof (3 lines) |
-| **No BPTT** in training | Encoder has zero learnable parameters; β values are preset constants, not optimized | ✅ By construction |
-| **~23K effective context** in float32 | Multi-timescale channels (h=1 to h=1000) jointly cover different temporal ranges | ✅ Quantitative formula |
-
-### What this does NOT claim
-
-- "Lossless" is a **mathematical** property under exact arithmetic. Finite-precision float32/64 limits resolution (quantified in §4.3 of the paper).
-- O(1) is **with respect to T** (sequence length). The decoder cost is O(|active_slots| × d), bounded by O(V × d) — a constant for fixed architecture, but can be large.
-- The current experiments are **small-scale** (≤1M params, 2 layers). Large-scale validation is future work.
-
-## Results
-
-### WikiText-2 (BPE 8K vocab, d=64, 2 layers, 960 epochs)
-
-| Model | Params | Val PPL ↓ | Val Acc ↑ |
-|-------|--------|-----------|-----------|
-| **EMA Slot Transformer** | **1,014K** | **35.7** | **33.9%** |
-| Transformer (no weight tying) | 1,124K | 38.4 | 32.2% |
-| Transformer (weight tying) | 612K | 39.5 | 31.3% |
-
-→ Zero-parameter encoder + standard decoder = fewer params, better perplexity.
-
-### DailyDialog (80K sentences, ~758K params)
-
-| Model | Train Acc | Val Acc | Val PPL |
-|-------|-----------|---------|---------|
-| **EMA Slot Transformer** | **53.3%** | 34.7% | 143.3 |
-| Baseline Transformer | 39.8% | 34.8% | 45.1 |
-
-→ Validation accuracy matches baseline. 13.5pp higher training accuracy demonstrates higher information density in EMA representation. PPL gap reverses on WikiText-2 — indicating a data-scale phenomenon, not an architectural limit.
-
-### Memorization (Bilinear Voter, TinyStories)
-
-8.1M parameters memorize 0.96M token positions at **99.2% accuracy**.
-
-## How it works
-
-```
-Token ──→ Retina ──→ EMA Encoder ──→ Q matrix ──→ [Any Decoder] ──→ Prediction
-          (word→slots)  (no params)    (V × N)       (all learning
-                                       fixed size     happens here)
-```
-
-### 1. Retina (tokenization → slot mapping)
-- **Identity**: 1 word = 1 slot (used in experiments)
-- **N-gram hash**: character n-grams → shared slot space (compression)
-
-### 2. EMA Encoder (zero learnable parameters)
-```
-Q_i^(n)(t) = β_n · Q_i^(n)(t-1) + x_i(t)
-```
-- `β_n = exp(-ln2 / h_n)` with half-lives `h_1=1` to `h_N=1000`
-- Each slot independently tracks its activation history across N timescales
-- **Theorem 1**: this mapping is injective for transcendental β (which almost all reals are)
-
-### 3. Decoder (all model capacity)
-- **Causal Cross-Attention Transformer**: projects Q values into embedding space, uses latest-word as query, historical slots as keys/values
-- **Bilinear Voter**: nonlinear feature map φ(Q) → bilinear scoring → weighted slot votes
+| Property | Mechanism |
+|----------|-----------|
+| **O(1) inference state** | State size = V × N, independent of sequence length |
+| **No BPTT** | EMA update is analytic: C ← ρC + I(x=k), no learnable params in state |
+| **Intrinsic position encoding** | Exponential decay ρ^(T-t) naturally encodes relative distance |
+| **Infinite context training** | c_base carries full document history across arbitrary chunk boundaries |
+| **Hyperparameter robust** | N=32~128, half-life=1024~4096 all give <2% PPL variation |
 
 ## Quick Start
 
+### Install
 ```bash
-git clone https://github.com/Mr-Skeleton-Max/MathBrain.git
-cd MathBrain
-pip install -e .
+pip install -r requirements.txt
 ```
 
-**Requirements**: Python ≥ 3.10, PyTorch ≥ 2.0 (CUDA), Triton ≥ 2.0
-
-### Train EMA Slot Transformer on WikiText-2
-
+### Prepare Data
 ```bash
-# Step 1: Train BPE tokenizer
-python train_bpe.py --corpus datasets/wikitext2_train.txt --vocab-size 8000
-
-# Step 2: Train model
-python train_gpu.py --corpus datasets/wikitext2_train.txt \
-    --val-corpus datasets/wikitext2_val.txt \
-    --epochs 960 --transformer --d-model 64 --n-layers 2 \
-    --pe-mode linear --scheduler cosine --N 64 \
-    --half-life 1 1000 --retina identity --tokenizer bpe
+# WikiText-103
+python datasets/prepare_wikitext103.py
 ```
 
-### Train on DailyDialog
-
+### Train
 ```bash
-python train_gpu.py --corpus datasets/dailydialog_utt_all_train.txt \
-    --val-corpus datasets/dailydialog_utt_all_val.txt \
-    --epochs 640 --transformer --d-model 64 --pe-mode linear \
-    --eval-every 160 --scheduler cosine --N 64 --half-life 1 1000 \
-    --retina identity
+# Per-Slot EMA (seq_len is just a compute parameter — c_base provides full context)
+python train.py --model ema \
+    --train_file datasets/wikitext103_train.txt \
+    --val_file datasets/wikitext103_val.txt \
+    --tokenizer gpt2 \
+    --d_model 512 --n_layers 6 --n_heads 8 --N 64 \
+    --seq_len 512 --batch_size 56 \
+    --lr 3e-4 --epochs 20
+
+# RoPE Transformer baseline (seq_len = context window)
+python train.py --model rope \
+    --train_file datasets/wikitext103_train.txt \
+    --val_file datasets/wikitext103_val.txt \
+    --tokenizer gpt2 \
+    --d_model 512 --n_layers 6 --n_heads 8 \
+    --seq_len 2048 --batch_size 16 \
+    --lr 3e-4 --epochs 20
 ```
 
-### Train Bilinear Voter on TinyStories
-
+### Run Tests
 ```bash
-python train_gpu.py --corpus datasets/tinystories_1000.txt --epochs 100
+python tests/test_pipeline_thorough.py         # CPU
+python tests/test_pipeline_thorough.py --cuda  # GPU (Triton)
 ```
 
-### CLI Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--corpus` | required | Training corpus file |
-| `--val-corpus` | — | Validation corpus file |
-| `--epochs` | 100 | Training epochs |
-| `--batch-size` | 4096 | Max positions per batch |
-| `--lr` | 0.01 | Max learning rate |
-| `--scheduler` | constant | LR schedule: constant / cosine / step / exp |
-| `--N` | 8 | Number of EMA timescales |
-| `--half-life` | — | Half-life range (e.g., `1 1000`) |
-| `--retina` | hash | Retina mode: hash / identity |
-| `--transformer` | off | Use SlotTransformer decoder |
-| `--d-model` | 128 | Transformer hidden dimension |
-| `--n-layers` | 2 | Number of decoder layers |
-| `--pe-mode` | fourier | Position encoding mode: fourier / linear |
-| `--tokenizer` | word | Tokenizer: word / bpe |
-
-## Project Structure
+## Architecture Overview
 
 ```
-MathBrain/
-├── train_gpu.py                    # Main training + evaluation CLI
-├── train_bpe.py                    # BPE tokenizer training
-├── baseline_transformer.py         # Standard Transformer baseline
-├── diagnose.py                     # Generalization diagnostic toolkit
-├── mathbrain/                      # Core package
-│   ├── config.py                   #   Hyperparameters
-│   ├── trainer.py                  #   GPU trainer
-│   ├── slot_transformer.py         #   Cross-attention decoder
-│   ├── retina.py                   #   Hash / Identity slot mapping
-│   ├── gpu_preprocessor.py         #   GPU batch iterator + dynamic EMA
-│   └── triton_kernels.py           #   Triton fused kernels
-├── datasets/                       # DailyDialog + TinyStories subsets
-├── paper/                          # Paper draft + supplementary
-│   ├── mathbrain_arxiv_draft.pdf   #   Latest paper (PDF)
-│   └── mathbrain_arxiv_draft.tex   #   LaTeX source
-└── experiments/                    # Analysis scripts + heatmaps
+Input: x₁, x₂, ..., x_T  (token sequence)
+          │
+          ▼
+┌─────────────────────┐
+│  Per-Slot EMA State  │  C[k] = ρ · C[k] + I(x_t = k)
+│  V × N matrix        │  Pure analytic, no gradients
+│  (one row per token)  │  c_base: carries full doc history
+└─────────────────────┘
+          │
+          ▼  SiLU(C · W_pe) → multiplicative gating
+┌─────────────────────┐
+│  Static Embeddings   │  E[k] ∈ R^d (shared across layers)
+│  × Time Gate         │  K = E ⊙ gate,  V = E ⊙ gate
+└─────────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│  Transformer Decoder │  Only Query iterates across layers
+│  (Cross-Attention)   │  Late Semantic Binding
+│  + FFN (SwiGLU)      │
+└─────────────────────┘
+          │
+          ▼
+      logits → next token prediction
 ```
 
-## Current Status
+## File Structure
 
-🟡 **Pre-print stage** — arXiv submission pending endorsement.
+```
+mathbrain/
+  model.py                 # SlotTransformerLM (Per-Slot EMA model)
+  baseline.py              # RoPETransformerLM (standard Transformer)
+  data.py                  # Document-aware data pipeline with c_base
+  ema.py                   # EMA decay rate computation
+  flash_ema_attention.py   # PyTorch reference implementation
+  triton_flash_ema.py      # Triton GPU kernels (forward + backward)
+  triton_ema_query.py      # Triton kernel for EMA sequential scan
+  triton_fused_gating.py   # Triton kernel for fused gating
 
-**Done:**
-- [x] Core EMA Slot encoder + two decoder backends
-- [x] Uniqueness theorem (Theorem 1) + precision analysis
-- [x] WikiText-2 benchmark: outperforms Transformer at matched scale
-- [x] DailyDialog benchmark: matches validation accuracy
-- [x] BPE tokenizer support
+train.py                   # Training script (EMA + RoPE)
+tests/                     # Pipeline correctness tests
+datasets/                  # Data preparation scripts
+```
 
-**Planned:**
-- [ ] Large-scale experiments (>1M params, long context)
-- [ ] Direct comparison with S4 / Mamba at matched scale
-- [ ] Empirical |S_active| saturation curve vs T
-- [ ] arXiv submission
+## Important: Data Pipeline Requirements
 
-## Paper
+Per-Slot EMA is sensitive to **causal purity** — each training chunk must come from exactly one document. Cross-document concatenation introduces spurious temporal co-occurrences that EMA records as real signals (PPL degrades from 23.3 to 30.6). The data pipeline enforces this by:
 
-> **[EMA Slot Encoding: A Parameter-Free Sequence Context Encoder with O(1) Inference and No Backpropagation Through Time](paper/mathbrain_arxiv_draft.pdf)**
->
-> Yuyue Li, March 2026
+1. Per-document chunking (no cross-doc concatenation)
+2. c_base loaded only from same-document history
+3. Loss masked at padding positions
+
+This is not a bug — it's a fundamental property of temporal statistics-based models.
 
 ## Citation
 
-```bibtex
-@article{li2026ema_slot,
-  title   = {EMA Slot Encoding: A Parameter-Free Sequence Context Encoder
-             with O(1) Inference and No Backpropagation Through Time},
-  author  = {Li, Yuyue},
-  year    = {2026}
-}
-```
+Paper forthcoming.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache 2.0

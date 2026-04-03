@@ -6,36 +6,42 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-*.egg
 
 # Virtual environments
 venv/
 .venv/
-env/
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Large binary files
+# Binary / large files
 *.pkl
 *.npz
 *.npy
 *.pt
 *.pth
 *.ckpt
+*.bin
 *.safetensors
 
-# Model checkpoints
-models/
+# Preprocessing cache
+processed_data/
+
+# Checkpoints & experiments
 checkpoints/
+experiments/
+
+# Datasets (download via prepare scripts)
+datasets/*.txt
+datasets/wikitext/
+datasets/tiktoken_cache/
+datasets/dailydialog/
 
 # LaTeX build artifacts
 *.aux
@@ -46,26 +52,13 @@ checkpoints/
 *.log
 *.out
 *.synctex.gz
+*.toc
 
-# Logs
+# Misc
 *.log
-.codex_logs/
-
-# Large datasets (keep small demo files)
-datasets/tinystories_full.txt
-datasets/natural/
-datasets/natural_clean/
-datasets/tinystories/
-
-EXP/
-
-# Conversation exports
-2026-*.txt
-
-# Paper - only keep main draft
-paper/Encoder.pdf
-paper/diff.pdf
-paper/claims_faq.*
-paper/mathbrain_diff.*
-paper/response_letter.*
-paper/question_going_to_fuck.md
+old/
+per-slot-ema-encoder/
+cache/
+experiment_record/
+ref_papers/
+paper/
