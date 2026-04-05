@@ -268,7 +268,7 @@ def flash_ema_forward_v2(Q, E_k_active, E_v_active, W_pe, V_total, unique_tensor
     B, H, L, hd = Q.shape
     D = H * hd
     device = Q.device
-    N = rhos.shape[0]
+    N = c_all.shape[-1]  # c_all: [B, L, K_max, N]
 
     E_k = E_k_active.view(B, K_max, H, hd).contiguous()
     E_v = E_v_active.view(B, K_max, H, hd).contiguous()
