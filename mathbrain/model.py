@@ -187,8 +187,12 @@ class SlotTransformerLM(nn.Module):
 
             C_bounds = precompute_boundaries(x, unique_tensor, self.ema_rhos, 64, c_init=c_base_kv)
 
-            # Full EMA scan: c_all[B, L, K_max, N] — shared across all layers
-            c_all = compute_c_all(x, unique_tensor, self.ema_rhos, K_max, c_init=c_base_kv)
+            # V2 decomposed gate: compute c_all once, shared across layers
+            # Disabled by default — enable with USE_V2=True env var for benchmarking
+            c_all = None
+            import os
+            if os.environ.get('USE_V2', '0') == '1':
+                c_all = compute_c_all(x, unique_tensor, self.ema_rhos, K_max, c_init=c_base_kv)
 
         for layer in self.layers:
             x_q = layer(x_q, x, E_slots, self.ema_rhos, C_seq, unique_tensor, K_max, C_bounds, c_all)
