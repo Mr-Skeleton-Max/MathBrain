@@ -571,7 +571,7 @@ def _pad_n_dim(rhos, W_pe, C_bounds, c_init, BLOCK_N):
     return rhos, W_pe, C_bounds, c_init
 
 
-def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu=True, Br=64, BLOCK_T=8):
+def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu=True, Br=64, BLOCK_T=4):
     B, H, L, hd = Q.shape
     device = Q.device
 
