@@ -115,39 +115,28 @@ def precompute_boundaries(x, unique_tensor, rhos, Br, c_init=None, doc_ids=None)
 
 # ─────────────────────────────────────────────────
 # 2. Forward Kernel  (Grid: B*H × num_t_chunks)
-#    Three-phase design per time-batch:
-#    Phase 1: Sequential EMA evolution → store c_decayed to scratch
-#    Phase 2: Batched gate projection (one big tl.dot)
-#    Phase 3: Sequential attention using precomputed gates
 # ─────────────────────────────────────────────────
 if HAS_TRITON:
     @triton.jit
     def _flash_ema_fwd(
         Q, x_labels, E_k, E_v, W_pe, rhos_ptr, C_bounds, unique_ptr,
         Out, M_ptr, L_ptr, LSE_out,
-        c_scratch, gate_scratch,
         doc_ids_ptr, has_doc_ids: tl.constexpr,
         stride_qb, stride_qh, stride_ql, stride_qd,
         B, H, L, hd: tl.constexpr, K_max, V_total,
         num_chunks, num_k_chunks,
         BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
         BLOCK_N: tl.constexpr, USE_SILU: tl.constexpr,
-        BLOCK_T: tl.constexpr,
     ):
         pid_bh = tl.program_id(0)
         pid_tc = tl.program_id(1)
         b = pid_bh // H
         h = pid_bh % H
-        block_id = pid_bh * num_chunks + pid_tc
 
         t_start = pid_tc * BLOCK_M
         offs_d = tl.arange(0, hd)
-        offs_n = tl.arange(0, BLOCK_N)
 
-        # Scratch buffer bases for this block
-        cs_base = block_id * BLOCK_T * BLOCK_K * BLOCK_N   # c_scratch
-        gs_base = block_id * BLOCK_T * BLOCK_K * hd        # gate_scratch
-
+        # Load initial prev_doc for boundary detection
         prev_doc = -1
         if has_doc_ids:
             prev_doc = tl.load(doc_ids_ptr + b * L + t_start, mask=t_start < L, other=-1)
@@ -157,6 +146,7 @@ if HAS_TRITON:
             offs_k = k_start + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K_max
 
+            offs_n = tl.arange(0, BLOCK_N)
             c_off = (b * num_chunks * K_max * BLOCK_N
                      + pid_tc * K_max * BLOCK_N
                      + offs_k[:, None] * BLOCK_N + offs_n[None, :])
@@ -168,115 +158,88 @@ if HAS_TRITON:
 
             wpe_off = offs_n[:, None] * H * hd + h * hd + offs_d[None, :]
             w_pe = tl.load(W_pe + wpe_off)
-            w_pe_tc = w_pe.to(tl.bfloat16)
+            w_pe_tc = w_pe.to(tl.bfloat16)  # hoist cast outside t-loop (invariant)
 
             uk = tl.load(unique_ptr + b * K_max + offs_k, mask=k_mask, other=-1)
-            valid_k = (uk != -1) & k_mask
+            valid_k = (uk != -1) & k_mask  # hoist validity check (invariant across t)
             rhos_v = tl.load(rhos_ptr + offs_n)
 
+            # Reset prev_doc tracking for each k-chunk (same time range)
             if has_doc_ids:
                 prev_doc = tl.load(doc_ids_ptr + b * L + t_start, mask=t_start < L, other=-1)
 
-            num_t_batches: tl.constexpr = BLOCK_M // BLOCK_T
+            for t_step in range(BLOCK_M):
+                t_global = t_start + t_step
+                mt = t_global < L
 
-            for tb in range(num_t_batches):
-                tb_start = tb * BLOCK_T
+                x_base = x_labels + b * L + t_global
+                x_val = tl.load(x_base, mask=mt, other=-1)
+                match = ((x_val == uk) & mt).to(tl.float32)
 
-                # ── Phase 1: Sequential EMA evolution → store c_decayed to scratch ──
-                for dt in range(BLOCK_T):
-                    t_step = tb_start + dt
-                    t_global = t_start + t_step
-                    mt = t_global < L
+                # Document boundary: reset C
+                if has_doc_ids:
+                    cur_doc = tl.load(doc_ids_ptr + b * L + t_global, mask=mt, other=-1)
+                    boundary = (cur_doc != prev_doc) & (t_step > 0) & mt
+                    keep = 1.0 - boundary.to(tl.float32)
+                    c_local = c_local * keep
+                    prev_doc = cur_doc
 
-                    x_val = tl.load(x_labels + b * L + t_global, mask=mt, other=-1)
-                    match = ((x_val == uk) & mt).to(tl.float32)
+                c_decayed = c_local * rhos_v[None, :]
 
-                    if has_doc_ids:
-                        cur_doc = tl.load(doc_ids_ptr + b * L + t_global, mask=mt, other=-1)
-                        boundary = (cur_doc != prev_doc) & (t_step > 0) & mt
-                        keep = 1.0 - boundary.to(tl.float32)
-                        c_local = c_local * keep
-                        prev_doc = cur_doc
-
-                    c_decayed = c_local * rhos_v[None, :]
-
-                    # Store c_decayed to scratch: [BLOCK_K, BLOCK_N]
-                    cs_off = cs_base + dt * BLOCK_K * BLOCK_N + tl.arange(0, BLOCK_K)[:, None] * BLOCK_N + offs_n[None, :]
-                    tl.store(c_scratch + cs_off, c_decayed, mask=k_mask[:, None])
-
-                    c_local = c_decayed + match[:, None]
-
-                # ── Phase 2: Batched gate projection ──
-                # Load [BLOCK_T*BLOCK_K, BLOCK_N] from scratch
-                offs_tk = tl.arange(0, BLOCK_T * BLOCK_K)
-                dt_idx = offs_tk // BLOCK_K
-                dk_idx = offs_tk % BLOCK_K
-                batch_k_mask = (k_start + dk_idx) < K_max
-
-                cs_batch_off = cs_base + dt_idx[:, None] * BLOCK_K * BLOCK_N + dk_idx[:, None] * BLOCK_N + offs_n[None, :]
-                c_batch = tl.load(c_scratch + cs_batch_off, mask=batch_k_mask[:, None], other=0.0)
-
-                c_batch_tc = c_batch.to(tl.bfloat16)
-                pre_act_all = tl.dot(c_batch_tc, w_pe_tc, out_dtype=tl.float32)
+                # Tensor Core matmul
+                c_decayed_tc = c_decayed.to(tl.bfloat16)
+                pre_act = tl.dot(c_decayed_tc, w_pe_tc, out_dtype=tl.float32)
 
                 if USE_SILU:
-                    p_gate_all = pre_act_all * tl.sigmoid(pre_act_all)
+                    sig = tl.sigmoid(pre_act)
+                    p_gate = pre_act * sig
                 else:
-                    p_gate_all = pre_act_all
+                    p_gate = pre_act
 
-                # Store p_gate to gate_scratch: [BLOCK_T*BLOCK_K, hd]
-                gs_batch_off = gs_base + dt_idx[:, None] * BLOCK_K * hd + dk_idx[:, None] * hd + offs_d[None, :]
-                tl.store(gate_scratch + gs_batch_off, p_gate_all, mask=batch_k_mask[:, None])
+                k_dyn = e_k * p_gate                             
+                v_dyn = e_v * p_gate                             
 
-                # ── Phase 3: Attention using precomputed gates ──
-                for dt in range(BLOCK_T):
-                    t_step = tb_start + dt
-                    t_global = t_start + t_step
-                    mt = t_global < L
+                q_ptrs = Q + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
+                q_t = tl.load(q_ptrs, mask=mt, other=0.0)  
 
-                    # Load precomputed gate for this timestep
-                    gs_off = gs_base + dt * BLOCK_K * hd + tl.arange(0, BLOCK_K)[:, None] * hd + offs_d[None, :]
-                    p_gate = tl.load(gate_scratch + gs_off, mask=k_mask[:, None], other=0.0)
+                # Score
+                s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
+                valid = valid_k & mt
+                s_t = tl.where(valid, s_t, float('-inf'))
 
-                    k_dyn = e_k * p_gate
-                    v_dyn = e_v * p_gate
+                # L2 Cache accumulators!
+                m_ptr = M_ptr + b * H * L + h * L + t_global
+                l_ptr = L_ptr + b * H * L + h * L + t_global
+                o_ptrs = Out + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
 
-                    q_ptrs = Q + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
-                    q_t = tl.load(q_ptrs, mask=mt, other=0.0)
+                # Initial values for M and L handle the V_total scaling dynamically
+                if kc == 0:
+                    m_old = -float('inf')
+                    l_old = (V_total - K_max).to(tl.float32)
+                    o_old = tl.zeros((hd,), dtype=tl.float32)
+                else:
+                    m_old = tl.load(m_ptr, mask=mt, other=float('-inf'))
+                    l_old = tl.load(l_ptr, mask=mt, other=0.0)
+                    o_old = tl.load(o_ptrs, mask=mt, other=0.0)
 
-                    s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
-                    valid = valid_k & mt
-                    s_t = tl.where(valid, s_t, float('-inf'))
+                m_chunk = tl.max(s_t)
+                m_new = tl.maximum(m_old, m_chunk)
+                alpha = tl.exp(m_old - m_new)
+                exp_s = tl.where(valid, tl.exp(s_t - m_new), 0.0)
 
-                    m_ptr = M_ptr + b * H * L + h * L + t_global
-                    l_ptr = L_ptr + b * H * L + h * L + t_global
-                    o_ptrs = Out + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
+                l_new = l_old * alpha + tl.sum(exp_s)
+                o_new = o_old * alpha + tl.sum(exp_s[:, None] * v_dyn, axis=0)
 
-                    if kc == 0:
-                        m_old = -float('inf')
-                        l_old = (V_total - K_max).to(tl.float32)
-                        o_old = tl.zeros((hd,), dtype=tl.float32)
-                    else:
-                        m_old = tl.load(m_ptr, mask=mt, other=float('-inf'))
-                        l_old = tl.load(l_ptr, mask=mt, other=0.0)
-                        o_old = tl.load(o_ptrs, mask=mt, other=0.0)
+                tl.store(m_ptr, m_new, mask=mt)
+                tl.store(l_ptr, l_new, mask=mt)
+                tl.store(o_ptrs, o_new, mask=mt)
+                
+                if kc == num_k_chunks - 1:
+                    lse_val = m_new + tl.log(l_new)
+                    lse_ptr = LSE_out + b * H * L + h * L + t_global
+                    tl.store(lse_ptr, lse_val, mask=mt)
 
-                    m_chunk = tl.max(s_t)
-                    m_new = tl.maximum(m_old, m_chunk)
-                    alpha = tl.exp(m_old - m_new)
-                    exp_s = tl.where(valid, tl.exp(s_t - m_new), 0.0)
-
-                    l_new = l_old * alpha + tl.sum(exp_s)
-                    o_new = o_old * alpha + tl.sum(exp_s[:, None] * v_dyn, axis=0)
-
-                    tl.store(m_ptr, m_new, mask=mt)
-                    tl.store(l_ptr, l_new, mask=mt)
-                    tl.store(o_ptrs, o_new, mask=mt)
-
-                    if kc == num_k_chunks - 1:
-                        lse_val = m_new + tl.log(l_new)
-                        lse_ptr = LSE_out + b * H * L + h * L + t_global
-                        tl.store(lse_ptr, lse_val, mask=mt)
+                c_local = c_decayed + match[:, None]
 
 
 # ─────────────────────────────────────────────────
@@ -571,7 +534,7 @@ def _pad_n_dim(rhos, W_pe, C_bounds, c_init, BLOCK_N):
     return rhos, W_pe, C_bounds, c_init
 
 
-def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu=True, Br=64, BLOCK_T=4):
+def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu=True, Br=64):
     B, H, L, hd = Q.shape
     device = Q.device
 
@@ -594,11 +557,6 @@ def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_
 
     rhos_p, W_pe_p, C_bounds_p, _ = _pad_n_dim(rhos, W_pe.contiguous(), C_bounds, None, BLOCK_N)
 
-    # Scratch buffers for batched gate projection (reused per BLOCK_T mini-batch)
-    n_blocks = B * H * num_chunks
-    c_scratch = torch.empty(n_blocks, BLOCK_T, BLOCK_K, BLOCK_N, device=device, dtype=torch.float32)
-    gate_scratch = torch.empty(n_blocks, BLOCK_T, BLOCK_K, hd, device=device, dtype=torch.float32)
-
     # doc_ids not needed: data layer guarantees single-document chunks
     doc_ids_dummy = torch.zeros(B, L, dtype=torch.int32, device=device)
 
@@ -606,13 +564,11 @@ def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_
     _flash_ema_fwd[grid](
         Q, x, E_k, E_v, W_pe_p, rhos_p, C_bounds_p, unique_tensor,
         O, M_val, L_val, LSE,
-        c_scratch, gate_scratch,
         doc_ids_dummy, False,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         B, H, L, hd, K_max, V_total,
         num_chunks, num_k_chunks,
         BLOCK_M=Br, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, USE_SILU=use_silu,
-        BLOCK_T=BLOCK_T,
     )
 
     O = O / L_val.unsqueeze(-1)
