@@ -102,7 +102,7 @@ def precompute_boundaries(x, unique_tensor, rhos, Br, c_init=None, doc_ids=None)
         if not has_doc_ids:
             doc_ids = torch.zeros(B, L, dtype=torch.int32, device=x.device)
 
-        BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+        BLOCK_K = max(16, min(128, triton.next_power_of_2(K_max)))
         grid = (B, triton.cdiv(K_max, BLOCK_K))
         _c_boundary_scan[grid](
             x, unique_tensor, rhos_p, c_bounds, c_init,
@@ -550,7 +550,7 @@ def flash_ema_forward(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_
         raise NotImplementedError("triton_flash_ema natively requires Triton CUDA. Fallback logic should intercept!")
 
     num_chunks = max(1, triton.cdiv(L, Br))
-    BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+    BLOCK_K = max(16, min(128, triton.next_power_of_2(K_max)))
     num_k_chunks = triton.cdiv(K_max, BLOCK_K)
     N = rhos.shape[0]
     BLOCK_N = max(N, 16)
@@ -603,7 +603,7 @@ class FlashEMAFunction(torch.autograd.Function):
             raise NotImplementedError("triton_flash_ema natively requires Triton CUDA.")
 
         num_chunks = max(1, triton.cdiv(L, Br))
-        BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+        BLOCK_K = max(16, min(128, triton.next_power_of_2(K_max)))
         num_k_chunks = triton.cdiv(K_max, BLOCK_K)
 
         dO = dO.contiguous()
