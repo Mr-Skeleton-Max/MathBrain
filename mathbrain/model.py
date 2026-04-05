@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from .flash_ema_attention import flash_ema_forward
 from .triton_ema_query import compute_query_ema_history
 from .triton_fused_gating import fused_apply_symmetric_query_gating
-from .triton_flash_ema import FlashEMAFunction, FlashEMAFunctionV2, HAS_TRITON, _build_unique_index, precompute_boundaries, compute_c_all
+from .triton_flash_ema import FlashEMAFunction, FlashEMAFunctionSplitK, HAS_TRITON, _build_unique_index, precompute_boundaries  # noqa: F401
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -55,7 +55,10 @@ class SlotAttentionLayer(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
         self.use_silu = use_silu
 
-    def forward(self, x_q, x, E_slots, rhos, C_seq, unique_tensor=None, K_max=None, C_bounds=None, c_all=None):
+        import os
+        self._use_splitk = os.environ.get('USE_V2', '0') == '1'
+
+    def forward(self, x_q, x, E_slots, rhos, C_seq, unique_tensor=None, K_max=None, C_bounds=None):
         B, L, D = x_q.shape
         device = x.device
 
@@ -81,14 +84,14 @@ class SlotAttentionLayer(nn.Module):
             Q_mha = Q_t.view(B, L, H, hd).transpose(1, 2).contiguous()
             W_pe_t = self.pe_proj.weight.t().contiguous()
 
-            if c_all is not None:
-                # V2: cuBLAS gate projection (large matmul) + simplified attention kernel
-                out_mha = FlashEMAFunctionV2.apply(
+            if self._use_splitk:
+                # Split-K: k-chunks run in parallel, then reduce
+                out_mha = FlashEMAFunctionSplitK.apply(
                     Q_mha, x, E_k_active, E_v_active, W_pe_t, rhos, E_slots.shape[0],
-                    unique_tensor, K_max, c_all, C_bounds, self.use_silu
+                    unique_tensor, K_max, C_bounds, self.use_silu
                 )
             else:
-                # V1: original fused kernel (fallback)
+                # V1: original fused kernel
                 out_mha = FlashEMAFunction.apply(
                     Q_mha, x, E_k_active, E_v_active, W_pe_t, rhos, E_slots.shape[0],
                     unique_tensor, K_max, C_bounds, self.use_silu
@@ -118,8 +121,8 @@ class SlotTransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(d_model)
         self.ffn = SwiGLU(d_model, d_ff)
 
-    def forward(self, x_q, x, E_slots, rhos, C_seq, unique_tensor=None, K_max=None, C_bounds=None, c_all=None):
-        h = x_q + self.attn(self.attn_norm(x_q), x, E_slots, rhos, C_seq, unique_tensor, K_max, C_bounds, c_all)
+    def forward(self, x_q, x, E_slots, rhos, C_seq, unique_tensor=None, K_max=None, C_bounds=None):
+        h = x_q + self.attn(self.attn_norm(x_q), x, E_slots, rhos, C_seq, unique_tensor, K_max, C_bounds)
         h = h + self.ffn(self.ffn_norm(h))
         return h
 
@@ -187,15 +190,8 @@ class SlotTransformerLM(nn.Module):
 
             C_bounds = precompute_boundaries(x, unique_tensor, self.ema_rhos, 64, c_init=c_base_kv)
 
-            # V2 decomposed gate: compute c_all once, shared across layers
-            # Disabled by default — enable with USE_V2=True env var for benchmarking
-            c_all = None
-            import os
-            if os.environ.get('USE_V2', '0') == '1':
-                c_all = compute_c_all(x, unique_tensor, self.ema_rhos, K_max, c_init=c_base_kv)
-
         for layer in self.layers:
-            x_q = layer(x_q, x, E_slots, self.ema_rhos, C_seq, unique_tensor, K_max, C_bounds, c_all)
+            x_q = layer(x_q, x, E_slots, self.ema_rhos, C_seq, unique_tensor, K_max, C_bounds)
 
         x_q = self.final_norm(x_q)
         return self.lm_head(x_q)

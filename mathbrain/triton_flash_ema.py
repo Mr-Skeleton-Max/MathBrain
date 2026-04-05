@@ -114,7 +114,207 @@ def precompute_boundaries(x, unique_tensor, rhos, Br, c_init=None, doc_ids=None)
 
 
 # ─────────────────────────────────────────────────
-# 1b. Full EMA Scan — stores c_decayed at EVERY timestep
+# 1b. Split-K Forward: k-chunks run in PARALLEL
+#     Each block handles 1 k-chunk × BLOCK_M timesteps
+#     Outputs partial (m, l, o) per k-chunk
+# ─────────────────────────────────────────────────
+if HAS_TRITON:
+    @triton.jit
+    def _flash_ema_fwd_splitk(
+        Q, x_labels, E_k, E_v, W_pe, rhos_ptr, C_bounds, unique_ptr,
+        m_partial, l_partial, o_partial,
+        stride_qb, stride_qh, stride_ql, stride_qd,
+        B, H, L, hd: tl.constexpr, K_max,
+        num_chunks, num_k_chunks,
+        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+        BLOCK_N: tl.constexpr, USE_SILU: tl.constexpr,
+    ):
+        """Split-K forward: each block processes ONE k-chunk for ONE time chunk."""
+        pid_bh = tl.program_id(0)
+        pid_tc = tl.program_id(1)
+        pid_kc = tl.program_id(2)  # k-chunk index — NEW parallel dim
+        b = pid_bh // H
+        h = pid_bh % H
+
+        t_start = pid_tc * BLOCK_M
+        offs_d = tl.arange(0, hd)
+        offs_n = tl.arange(0, BLOCK_N)
+
+        # Load data for this single k-chunk
+        k_start = pid_kc * BLOCK_K
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K_max
+
+        c_off = (b * num_chunks * K_max * BLOCK_N
+                 + pid_tc * K_max * BLOCK_N
+                 + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+        c_local = tl.load(C_bounds + c_off, mask=k_mask[:, None], other=0.0)
+
+        ek_off = b * K_max * H * hd + offs_k[:, None] * H * hd + h * hd + offs_d[None, :]
+        e_k = tl.load(E_k + ek_off, mask=k_mask[:, None], other=0.0)
+        e_v = tl.load(E_v + ek_off, mask=k_mask[:, None], other=0.0)
+
+        wpe_off = offs_n[:, None] * H * hd + h * hd + offs_d[None, :]
+        w_pe = tl.load(W_pe + wpe_off)
+        w_pe_tc = w_pe.to(tl.bfloat16)
+
+        uk = tl.load(unique_ptr + b * K_max + offs_k, mask=k_mask, other=-1)
+        valid_k = (uk != -1) & k_mask
+        rhos_v = tl.load(rhos_ptr + offs_n)
+
+        # Partial result base offset for this block
+        block_id = pid_bh * num_chunks * num_k_chunks + pid_tc * num_k_chunks + pid_kc
+
+        for t_step in range(BLOCK_M):
+            t_global = t_start + t_step
+            mt = t_global < L
+
+            x_val = tl.load(x_labels + b * L + t_global, mask=mt, other=-1)
+            match = ((x_val == uk) & mt).to(tl.float32)
+
+            c_decayed = c_local * rhos_v[None, :]
+            c_decayed_tc = c_decayed.to(tl.bfloat16)
+            pre_act = tl.dot(c_decayed_tc, w_pe_tc, out_dtype=tl.float32)
+
+            if USE_SILU:
+                p_gate = pre_act * tl.sigmoid(pre_act)
+            else:
+                p_gate = pre_act
+
+            k_dyn = e_k * p_gate
+            v_dyn = e_v * p_gate
+
+            q_ptrs = Q + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
+            q_t = tl.load(q_ptrs, mask=mt, other=0.0)
+
+            s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
+            valid = valid_k & mt
+            s_t = tl.where(valid, s_t, float('-inf'))
+
+            # Local softmax for this k-chunk only
+            m_local = tl.max(s_t)
+            exp_s = tl.where(valid, tl.exp(s_t - m_local), 0.0)
+            l_local = tl.sum(exp_s)
+            o_local = tl.sum(exp_s[:, None] * v_dyn, axis=0)  # [hd]
+
+            # Store partial results
+            ml_off = block_id * BLOCK_M + t_step
+            tl.store(m_partial + ml_off, m_local, mask=mt)
+            tl.store(l_partial + ml_off, l_local, mask=mt)
+
+            o_off = block_id * BLOCK_M * hd + t_step * hd + offs_d
+            tl.store(o_partial + o_off, o_local, mask=mt)
+
+            c_local = c_decayed + match[:, None]
+
+
+    @triton.jit
+    def _flash_ema_reduce(
+        m_partial, l_partial, o_partial,
+        Out, LSE_out,
+        stride_qb, stride_qh, stride_ql, stride_qd,
+        B, H, L, hd: tl.constexpr,
+        num_chunks, num_k_chunks: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        """Combine partial softmax results across k-chunks (FlashAttention rescaling)."""
+        pid_bh = tl.program_id(0)
+        pid_tc = tl.program_id(1)
+        b = pid_bh // H
+        h = pid_bh % H
+        t_start = pid_tc * BLOCK_M
+
+        offs_d = tl.arange(0, hd)
+
+        for t_step in range(BLOCK_M):
+            t_global = t_start + t_step
+            mt = t_global < L
+
+            m_global = -float('inf')
+            l_global = 0.0
+            o_global = tl.zeros((hd,), dtype=tl.float32)
+
+            base = pid_bh * num_chunks * num_k_chunks + pid_tc * num_k_chunks
+
+            for kc in range(num_k_chunks):
+                block_id = base + kc
+                ml_off = block_id * BLOCK_M + t_step
+
+                m_kc = tl.load(m_partial + ml_off, mask=mt, other=-float('inf'))
+                l_kc = tl.load(l_partial + ml_off, mask=mt, other=0.0)
+                o_kc = tl.load(o_partial + block_id * BLOCK_M * hd + t_step * hd + offs_d,
+                               mask=mt, other=0.0)
+
+                # FlashAttention rescaling
+                m_new = tl.maximum(m_global, m_kc)
+                alpha = tl.exp(m_global - m_new)
+                beta = tl.exp(m_kc - m_new)
+                l_global = l_global * alpha + l_kc * beta
+                o_global = o_global * alpha + o_kc * beta
+                m_global = m_new
+
+            # Normalize
+            o_final = o_global / tl.maximum(l_global, 1e-10)
+            lse_final = m_global + tl.log(tl.maximum(l_global, 1e-10))
+
+            o_ptrs = Out + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
+            tl.store(o_ptrs, o_final, mask=mt)
+            lse_ptr = LSE_out + b * H * L + h * L + t_global
+            tl.store(lse_ptr, lse_final, mask=mt)
+
+
+def flash_ema_forward_splitk(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu=True, Br=64):
+    """Split-K forward: k-chunks run in parallel, then reduce."""
+    B, H, L, hd = Q.shape
+    device = Q.device
+
+    E_k = E_k_active.view(B, K_max, H, hd).contiguous()
+    E_v = E_v_active.view(B, K_max, H, hd).contiguous()
+
+    N = rhos.shape[0]
+    BLOCK_N = max(N, 16)
+    num_chunks = max(1, triton.cdiv(L, Br))
+    BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+    num_k_chunks = triton.cdiv(K_max, BLOCK_K)
+
+    rhos_p, W_pe_p, C_bounds_p, _ = _pad_n_dim(rhos, W_pe.contiguous(), C_bounds, None, BLOCK_N)
+
+    # Partial result buffers
+    n_blocks = B * H * num_chunks * num_k_chunks
+    m_partial = torch.full((n_blocks * Br,), float('-inf'), device=device, dtype=torch.float32)
+    l_partial = torch.zeros(n_blocks * Br, device=device, dtype=torch.float32)
+    o_partial = torch.zeros(n_blocks * Br * hd, device=device, dtype=torch.float32)
+
+    # Stage 1: Split-K forward (k-chunks parallel)
+    grid_fwd = (B * H, num_chunks, num_k_chunks)
+    _flash_ema_fwd_splitk[grid_fwd](
+        Q, x, E_k, E_v, W_pe_p, rhos_p, C_bounds_p, unique_tensor,
+        m_partial, l_partial, o_partial,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        B, H, L, hd, K_max,
+        num_chunks, num_k_chunks,
+        BLOCK_M=Br, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, USE_SILU=use_silu,
+    )
+
+    # Stage 2: Reduce across k-chunks
+    O = torch.zeros_like(Q)
+    LSE = torch.empty(B, H, L, device=device, dtype=torch.float32)
+
+    grid_reduce = (B * H, num_chunks)
+    _flash_ema_reduce[grid_reduce](
+        m_partial, l_partial, o_partial,
+        O, LSE,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        B, H, L, hd,
+        num_chunks, num_k_chunks,
+        BLOCK_M=Br,
+    )
+
+    return O, LSE, C_bounds, E_k, E_v
+
+
+# ─────────────────────────────────────────────────
+# 1c. Full EMA Scan — stores c_decayed at EVERY timestep
 #     (for the decomposed gate projection approach)
 # ─────────────────────────────────────────────────
 if HAS_TRITON:
@@ -944,3 +1144,68 @@ class FlashEMAFunctionV2(torch.autograd.Function):
 
         # Arguments: Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, c_all, C_bounds, use_silu, Br
         return dQ_out, None, dE_k_active, dE_v_active, dW_pe_final, None, None, None, None, None, None, None, None
+
+
+class FlashEMAFunctionSplitK(torch.autograd.Function):
+    """Split-K forward (k-chunks parallel) + original backward."""
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
+    def forward(ctx, Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu=True, Br=64):
+        O, LSE, C_bounds, E_k, E_v = \
+            flash_ema_forward_splitk(Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu, Br)
+        ctx.save_for_backward(Q, x, E_k, E_v, W_pe, rhos, C_bounds, unique_tensor, O, LSE)
+        ctx.K_max = K_max
+        ctx.V_total = V_total
+        ctx.use_silu = use_silu
+        ctx.Br = Br
+        return O
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, dO):
+        # Reuse original backward kernels (serial k-chunks — optimize later)
+        Q, x, E_k, E_v, W_pe, rhos, C_bounds, unique_tensor, O, LSE = ctx.saved_tensors
+        B, H, L, hd = Q.shape
+        K_max = ctx.K_max
+        Br = ctx.Br
+        N = rhos.shape[0]
+        BLOCK_N = max(N, 16)
+
+        num_chunks = max(1, triton.cdiv(L, Br))
+        BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+        num_k_chunks = triton.cdiv(K_max, BLOCK_K)
+
+        dO = dO.contiguous()
+        D_vals = (dO * O).sum(dim=-1).contiguous()
+        rhos_p, W_pe_p, _, _ = _pad_n_dim(rhos, W_pe.contiguous(), None, None, BLOCK_N)
+
+        dQ_out = torch.zeros_like(Q)
+        dE_k_partitioned = torch.zeros(B, H, K_max, hd, device=Q.device, dtype=Q.dtype)
+        dE_v_partitioned = torch.zeros(B, H, K_max, hd, device=Q.device, dtype=Q.dtype)
+        n_blocks = B * H * num_chunks
+        dW_pe_partitioned = torch.zeros(n_blocks, BLOCK_N, W_pe.shape[1], device=Q.device, dtype=Q.dtype)
+
+        doc_ids_dummy = torch.zeros(B, L, dtype=torch.int32, device=Q.device)
+        grid = (B * H, num_chunks)
+        common_args = (Q, x, E_k, E_v, W_pe_p, rhos_p, C_bounds, unique_tensor)
+        common_kwargs = dict(
+            doc_ids_ptr=doc_ids_dummy, has_doc_ids=False,
+            stride_qb=Q.stride(0), stride_qh=Q.stride(1),
+            stride_ql=Q.stride(2), stride_qd=Q.stride(3),
+            B=B, H=H, L=L, hd=hd, K_max=K_max, V_total=ctx.V_total,
+            num_chunks=num_chunks, num_k_chunks=num_k_chunks,
+            BLOCK_M=Br, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, USE_SILU=ctx.use_silu,
+        )
+
+        _flash_ema_bwd_dq_de[grid](*common_args, dO, D_vals, LSE,
+                                    dQ_out, dE_k_partitioned, dE_v_partitioned, **common_kwargs)
+        _flash_ema_bwd_dw[grid](*common_args, dO, D_vals, LSE,
+                                dW_pe_partitioned, **common_kwargs)
+
+        dE_k_active = dE_k_partitioned.permute(0, 2, 1, 3).contiguous().view(B, K_max, H * hd)
+        dE_v_active = dE_v_partitioned.permute(0, 2, 1, 3).contiguous().view(B, K_max, H * hd)
+        dW_pe_reduced = dW_pe_partitioned.sum(dim=0)
+        dW_pe_final = dW_pe_reduced[:N, :]
+
+        # Arguments: Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu, Br
+        return dQ_out, None, dE_k_active, dE_v_active, dW_pe_final, None, None, None, None, None, None, None
