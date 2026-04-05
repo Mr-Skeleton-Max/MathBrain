@@ -158,8 +158,10 @@ if HAS_TRITON:
 
             wpe_off = offs_n[:, None] * H * hd + h * hd + offs_d[None, :]
             w_pe = tl.load(W_pe + wpe_off)
+            w_pe_tc = w_pe.to(tl.bfloat16)  # hoist cast outside t-loop (invariant)
 
             uk = tl.load(unique_ptr + b * K_max + offs_k, mask=k_mask, other=-1)
+            valid_k = (uk != -1) & k_mask  # hoist validity check (invariant across t)
             rhos_v = tl.load(rhos_ptr + offs_n)
 
             # Reset prev_doc tracking for each k-chunk (same time range)
@@ -184,11 +186,10 @@ if HAS_TRITON:
 
                 c_decayed = c_local * rhos_v[None, :]
 
-                # Tensor Core cast
+                # Tensor Core matmul
                 c_decayed_tc = c_decayed.to(tl.bfloat16)
-                w_pe_tc = w_pe.to(tl.bfloat16)
                 pre_act = tl.dot(c_decayed_tc, w_pe_tc, out_dtype=tl.float32)
-                
+
                 if USE_SILU:
                     sig = tl.sigmoid(pre_act)
                     p_gate = pre_act * sig
@@ -203,7 +204,7 @@ if HAS_TRITON:
 
                 # Score
                 s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
-                valid = (uk != -1) & k_mask & mt
+                valid = valid_k & mt
                 s_t = tl.where(valid, s_t, float('-inf'))
 
                 # L2 Cache accumulators!
@@ -283,6 +284,7 @@ if HAS_TRITON:
             e_v = tl.load(E_v + ek_off, mask=k_mask[:, None], other=0.0)
 
             uk = tl.load(unique_ptr + b * K_max + offs_k, mask=k_mask, other=-1)
+            valid_k = (uk != -1) & k_mask
 
             c_off = (b * num_chunks * K_max * BLOCK_N
                      + pid_tc * K_max * BLOCK_N
@@ -330,7 +332,7 @@ if HAS_TRITON:
                 lse_t = tl.load(LSE + b * H * L + h * L + t_global, mask=mt, other=0.0)
 
                 s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
-                valid = (uk != -1) & k_mask & mt
+                valid = valid_k & mt
                 s_t = tl.where(valid, s_t, float('-inf'))
 
                 p_t = tl.exp(s_t - lse_t)
@@ -351,8 +353,10 @@ if HAS_TRITON:
 
                 c_local = c_decayed + match[:, None]
 
-            tl.atomic_add(dE_k_out + ek_off, dE_k_acc, mask=k_mask[:, None])
-            tl.atomic_add(dE_v_out + ek_off, dE_v_acc, mask=k_mask[:, None])
+            # Write to partitioned buffer [B, H, K_max, hd] — only time chunks contend
+            de_off = b * H * K_max * hd + h * K_max * hd + offs_k[:, None] * hd + offs_d[None, :]
+            tl.atomic_add(dE_k_out + de_off, dE_k_acc, mask=k_mask[:, None])
+            tl.atomic_add(dE_v_out + de_off, dE_v_acc, mask=k_mask[:, None])
 
 
     @triton.jit
@@ -394,6 +398,7 @@ if HAS_TRITON:
             e_v = tl.load(E_v + ek_off, mask=k_mask[:, None], other=0.0)
 
             uk = tl.load(unique_ptr + b * K_max + offs_k, mask=k_mask, other=-1)
+            valid_k = (uk != -1) & k_mask
 
             c_off = (b * num_chunks * K_max * BLOCK_N
                      + pid_tc * K_max * BLOCK_N
@@ -440,7 +445,7 @@ if HAS_TRITON:
                 lse_t = tl.load(LSE + b * H * L + h * L + t_global, mask=mt, other=0.0)
 
                 s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
-                valid = (uk != -1) & k_mask & mt
+                valid = valid_k & mt
                 s_t = tl.where(valid, s_t, float('-inf'))
 
                 p_t = tl.exp(s_t - lse_t)
@@ -466,7 +471,10 @@ if HAS_TRITON:
 
                 c_local = c_decayed + match[:, None]
 
-        tl.atomic_add(dW_pe_out + wpe_off, dW_pe_acc)
+        # Write to per-block partition — zero atomic contention
+        block_id = pid_bh * num_chunks + pid_tc
+        dw_off = block_id * BLOCK_N * hd + offs_n[:, None] * hd + offs_d[None, :]
+        tl.store(dW_pe_out + dw_off, dW_pe_acc)
 
 
 # ─────────────────────────────────────────────────
@@ -604,9 +612,17 @@ class FlashEMAFunction(torch.autograd.Function):
         rhos_p, W_pe_p, _, _ = _pad_n_dim(rhos, W_pe.contiguous(), None, None, BLOCK_N)
 
         dQ_out = torch.zeros_like(Q)
-        dE_k_out = torch.zeros_like(E_k)
-        dE_v_out = torch.zeros_like(E_v)
-        dW_pe_out = torch.zeros(BLOCK_N, W_pe.shape[1], device=Q.device, dtype=Q.dtype)
+
+        # ── Partitioned gradient accumulation (eliminates atomic contention) ──
+        # Instead of all (B*H*num_chunks) thread blocks atomic_add'ing to shared
+        # dE_k/dE_v/dW_pe, each head writes to its own partition.
+        # dE_k/dE_v: partition by H (num_chunks reduce within kernel per k-chunk)
+        # dW_pe: partition by (B*H*num_chunks), reduce after kernel
+        dE_k_partitioned = torch.zeros(B, H, K_max, hd, device=Q.device, dtype=Q.dtype)
+        dE_v_partitioned = torch.zeros(B, H, K_max, hd, device=Q.device, dtype=Q.dtype)
+        # dW_pe: each (b,h,tc) block gets its own slot → no atomics needed
+        n_blocks = B * H * num_chunks
+        dW_pe_partitioned = torch.zeros(n_blocks, BLOCK_N, W_pe.shape[1], device=Q.device, dtype=Q.dtype)
 
         # doc_ids not needed: data layer guarantees single-document chunks
         doc_ids_dummy = torch.zeros(B, L, dtype=torch.int32, device=Q.device)
@@ -624,27 +640,32 @@ class FlashEMAFunction(torch.autograd.Function):
             BLOCK_M=Br, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, USE_SILU=ctx.use_silu,
         )
 
-        # Pass 1: dQ + dE_k + dE_v
+        # Pass 1: dQ + dE_k + dE_v (partitioned by head, atomic only across time chunks)
         _flash_ema_bwd_dq_de[grid](
             *common_args,
             dO, D_vals, LSE,
-            dQ_out, dE_k_out, dE_v_out,
+            dQ_out, dE_k_partitioned, dE_v_partitioned,
             **common_kwargs,
         )
 
-        # Pass 2: dW_pe only (no dQ/dE → fewer registers → less spilling)
+        # Pass 2: dW_pe only — each block writes to its own partition, zero atomics
         _flash_ema_bwd_dw[grid](
             *common_args,
             dO, D_vals, LSE,
-            dW_pe_out,
+            dW_pe_partitioned,
             **common_kwargs,
         )
 
-        dE_k_active = dE_k_out.view(B, K_max, H * hd)
-        dE_v_active = dE_v_out.view(B, K_max, H * hd)
+        # ── Reduce partitioned gradients ──
+        # dE_k/dE_v: sum across heads → [B, K_max, H*hd]
+        # The kernel writes to [B, H, K_max, hd] with atomic across time chunks only.
+        # We need to reshape to match E_k's layout [B, K_max, H, hd] → [B, K_max, H*hd]
+        dE_k_active = dE_k_partitioned.permute(0, 2, 1, 3).contiguous().view(B, K_max, H * hd)
+        dE_v_active = dE_v_partitioned.permute(0, 2, 1, 3).contiguous().view(B, K_max, H * hd)
 
-        # Truncate dW_pe back to original N (remove padding)
-        dW_pe_final = dW_pe_out[:N, :]
+        # dW_pe: sum across all blocks → [BLOCK_N, hd]
+        dW_pe_reduced = dW_pe_partitioned.sum(dim=0)
+        dW_pe_final = dW_pe_reduced[:N, :]
 
         # Arguments: Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu, Br
         return dQ_out, None, dE_k_active, dE_v_active, dW_pe_final, None, None, None, None, None, None, None
