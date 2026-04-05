@@ -169,14 +169,3 @@ def compute_query_ema_history(x: torch.Tensor, rhos: torch.Tensor, vocab_size: i
     return C_seq
 
 
-def apply_symmetric_query_gating(x_q, x, C_seq, pe_proj, ln_q, q_proj):
-    """
-    Applies the Variant C Symmetric Multiplicative Gating to the query.
-    """
-    import torch.nn.functional as F
-    
-    C_q_curr = C_seq + 1.0
-    P_gate_Q = F.silu(pe_proj(C_q_curr))
-    Q_emb = x_q * P_gate_Q
-    Q_out = q_proj(ln_q(Q_emb))
-    return Q_out

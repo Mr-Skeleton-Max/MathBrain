@@ -35,8 +35,6 @@ def flash_ema_forward(Q, x, E_k_slots, E_v_slots, rhos, pe_proj, n_heads, use_si
     # Internal baseline sequential buffer
     C_global = torch.zeros((B, V, N), device=device, dtype=torch.float32)
 
-    rhos_exp = rhos.unsqueeze(0).unsqueeze(0)  # [1, 1, N]
-    
     # Pre-expand E_k and E_v to [B, V, H, hd] for broadcasting later
     E_k = E_k_slots.view(V, H, hd).unsqueeze(0).expand(B, -1, -1, -1)  # [B, V, H, hd]
     E_v = E_v_slots.view(V, H, hd).unsqueeze(0).expand(B, -1, -1, -1)

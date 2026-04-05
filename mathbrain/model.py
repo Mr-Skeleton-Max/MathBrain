@@ -160,19 +160,22 @@ class SlotTransformerLM(nn.Module):
             C_seq = F.dropout(C_seq, p=self.ema_dropout, training=True)
 
         if HAS_TRITON and device.type == 'cuda':
-            unique_tensor, K_max = _build_unique_index(x, device)
+            if unique_slots is not None and pad_mask is not None:
+                # Use dataloader's expanded unique_slots directly (includes document history tokens).
+                # This avoids the old _build_unique_index(x) which only found chunk-local tokens,
+                # missing historical tokens with significant EMA state on slow decay scales.
+                unique_tensor = unique_slots.clone()
+                unique_tensor[~pad_mask] = -1  # Triton convention: -1 = padding
+                K_max = pad_mask.sum(dim=1).max().item()
+                K_max = max(K_max, 16)  # tl.dot minimum
+                unique_tensor = unique_tensor[:, :K_max]
 
-            # Map c_base from dataloader's unique_slots ordering → unique_tensor ordering
-            c_base_kv = None
-            if c_base is not None and unique_slots is not None and pad_mask is not None:
-                safe_us = unique_slots.clone()
-                safe_us[~pad_mask] = self.vocab_size
-                cb_lookup = torch.zeros(B, self.vocab_size + 1, self.n_scales, device=device)
-                us_idx = safe_us.unsqueeze(-1).expand(-1, -1, self.n_scales)
-                cb_lookup.scatter_(1, us_idx, c_base)
-                safe_ut = unique_tensor.clamp(min=0)
-                ut_idx = safe_ut.unsqueeze(-1).expand(-1, -1, self.n_scales)
-                c_base_kv = cb_lookup.gather(1, ut_idx)
+                # c_base is already aligned with unique_slots — no scatter/gather remapping needed
+                c_base_kv = c_base[:, :K_max, :] if c_base is not None else None
+            else:
+                # Fallback: no dataloader metadata, rebuild from chunk (e.g., standalone inference)
+                unique_tensor, K_max = _build_unique_index(x, device)
+                c_base_kv = None
 
             C_bounds = precompute_boundaries(x, unique_tensor, self.ema_rhos, 64, c_init=c_base_kv)
 

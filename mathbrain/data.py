@@ -19,7 +19,6 @@ import os
 import pickle
 from torch.utils.data import Dataset, Sampler
 import time
-import math
 
 
 class WikiTextMMapDataset(Dataset):
@@ -63,6 +62,8 @@ class WikiTextMMapDataset(Dataset):
                 current_doc = d
         doc_ranges.append((doc_start, total, current_doc))
 
+        self.doc_starts = {}  # doc_id -> flat_start position
+
         n_docs = 0
         total_useful = 0
         for doc_start, doc_end, doc_id in doc_ranges:
@@ -70,6 +71,7 @@ class WikiTextMMapDataset(Dataset):
             if doc_len < 2:
                 continue
             n_docs += 1
+            self.doc_starts[doc_id] = doc_start
 
             n_chunks = max(1, (doc_len - 1 + self.block_size - 1) // self.block_size)
             for c in range(n_chunks):
@@ -100,7 +102,27 @@ class WikiTextMMapDataset(Dataset):
         chunk = torch.from_numpy(chunk_np).long()
         chunk_doc_ids = torch.from_numpy(doc_ids_np).long()
 
-        unique_slots, inverse_indices = torch.unique(chunk, return_inverse=True)
+        # Chunk's own unique tokens (inverse_indices maps chunk positions → these)
+        chunk_unique, inverse_indices = torch.unique(chunk, return_inverse=True)
+        chunk_unique_set = set(chunk_unique.tolist())
+
+        # Expand: include ALL unique tokens from document history before this chunk.
+        # These tokens may have significant EMA state (especially on slow scales)
+        # and should participate in Memory-side Key/Value attention.
+        doc_start_pos = self.doc_starts[doc_id]
+        extra_tokens = []
+        if start > doc_start_pos:
+            history_np = self.tokens[doc_start_pos:start]
+            history_unique = np.unique(history_np)
+            extra_tokens = [int(t) for t in history_unique if int(t) not in chunk_unique_set]
+
+        # Build expanded unique_slots: chunk tokens FIRST (preserving inverse_indices), then extras
+        if extra_tokens:
+            extra_tensor = torch.tensor(extra_tokens, dtype=torch.long)
+            unique_slots = torch.cat([chunk_unique, extra_tensor])
+        else:
+            unique_slots = chunk_unique
+
         k = len(unique_slots)
 
         c_base = torch.zeros(k, self.N, dtype=torch.float32)
@@ -152,7 +174,6 @@ class TokenBudgetSampler(Sampler):
 
         self.batches = []
         current_batch = []
-        current_tokens = 0
         max_len_in_batch = 0
 
         for idx in indices:
@@ -167,12 +188,10 @@ class TokenBudgetSampler(Sampler):
                     current_batch.sort(key=lambda i: self.lengths[i])
                 self.batches.append(current_batch)
                 current_batch = [idx]
-                current_tokens = chunk_len
                 max_len_in_batch = chunk_len
             else:
                 current_batch.append(idx)
                 max_len_in_batch = new_max
-                current_tokens = max_len_in_batch * len(current_batch)
 
         if current_batch:
             if self.sort_within_batch:
@@ -215,9 +234,6 @@ def dynamic_collate_fn(batch):
 
     return chunks, unique_slots, pad_mask, inverse_indices, c_bases, K_max, doc_ids
 
-
-# Keep old collate_fn name for backward compatibility
-inverted_collate_fn = dynamic_collate_fn
 
 
 # ==========================================
