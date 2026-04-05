@@ -114,7 +114,215 @@ def precompute_boundaries(x, unique_tensor, rhos, Br, c_init=None, doc_ids=None)
 
 
 # ─────────────────────────────────────────────────
-# 2. Forward Kernel  (Grid: B*H × num_t_chunks)
+# 1b. Full EMA Scan — stores c_decayed at EVERY timestep
+#     (for the decomposed gate projection approach)
+# ─────────────────────────────────────────────────
+if HAS_TRITON:
+    @triton.jit
+    def _c_full_scan(
+        x_ptr, unique_ptr, rhos_ptr, c_all_ptr, c_init_ptr,
+        B, L, K_max, N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Compute c_decayed (after decay, before match update) at every timestep.
+        Output: c_all[B, L, K_max, N] — the value used for gate projection."""
+        pid_b = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        k_off = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = k_off < K_max
+        uk = tl.load(unique_ptr + pid_b * K_max + k_off, mask=k_mask, other=-1)
+
+        n_off = tl.arange(0, N)
+        rhos = tl.load(rhos_ptr + n_off)
+
+        c_init_off = pid_b * K_max * N + k_off[:, None] * N + n_off[None, :]
+        C = tl.load(c_init_ptr + c_init_off, mask=k_mask[:, None], other=0.0)
+
+        for t in range(L):
+            xt = tl.load(x_ptr + pid_b * L + t, mask=True, other=-1)
+            match = (xt == uk).to(tl.float32)
+
+            # Decay first (Variant C: gate sees decayed state BEFORE match)
+            c_decayed = C * rhos[None, :]
+
+            # Store c_decayed at this timestep
+            out_off = (pid_b * L * K_max * N
+                       + t * K_max * N
+                       + k_off[:, None] * N + n_off[None, :])
+            tl.store(c_all_ptr + out_off, c_decayed, mask=k_mask[:, None])
+
+            # Update: match AFTER storing (Variant C)
+            C = c_decayed + match[:, None]
+
+
+def compute_c_all(x, unique_tensor, rhos, K_max, c_init=None):
+    """Compute c_decayed at every timestep for all vocab slots. Shared across layers."""
+    B, L = x.shape
+    N = rhos.shape[0]
+    device = x.device
+
+    c_all = torch.empty(B, L, K_max, N, device=device, dtype=torch.float32)
+
+    if c_init is None:
+        c_init = torch.zeros(B, K_max, N, device=device, dtype=torch.float32)
+
+    BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+    grid = (B, triton.cdiv(K_max, BLOCK_K))
+    _c_full_scan[grid](
+        x, unique_tensor, rhos, c_all, c_init,
+        B, L, K_max, N,
+        BLOCK_K=BLOCK_K,
+    )
+    return c_all
+
+
+# ─────────────────────────────────────────────────
+# 1c. Attention-only kernel — uses precomputed P_gate
+# ─────────────────────────────────────────────────
+if HAS_TRITON:
+    @triton.jit
+    def _attn_with_gate(
+        Q, E_k, E_v, P_gate, unique_ptr,
+        Out, M_ptr, L_ptr, LSE_out,
+        stride_qb, stride_qh, stride_ql, stride_qd,
+        B, H, L, hd: tl.constexpr, K_max, V_total,
+        num_k_chunks,
+        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        """Attention kernel using precomputed P_gate. No tl.dot needed."""
+        pid_bh = tl.program_id(0)
+        pid_tc = tl.program_id(1)
+        b = pid_bh // H
+        h = pid_bh % H
+
+        t_start = pid_tc * BLOCK_M
+        offs_d = tl.arange(0, hd)
+
+        for kc in range(num_k_chunks):
+            k_start = kc * BLOCK_K
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K_max
+
+            ek_off = b * K_max * H * hd + offs_k[:, None] * H * hd + h * hd + offs_d[None, :]
+            e_k = tl.load(E_k + ek_off, mask=k_mask[:, None], other=0.0)
+            e_v = tl.load(E_v + ek_off, mask=k_mask[:, None], other=0.0)
+
+            uk = tl.load(unique_ptr + b * K_max + offs_k, mask=k_mask, other=-1)
+            valid_k = (uk != -1) & k_mask
+
+            for t_step in range(BLOCK_M):
+                t_global = t_start + t_step
+                mt = t_global < L
+
+                # Load precomputed gate for this (b, t, k_chunk, head)
+                pg_off = (b * L * K_max * H * hd
+                          + t_global * K_max * H * hd
+                          + offs_k[:, None] * H * hd
+                          + h * hd + offs_d[None, :])
+                p_gate = tl.load(P_gate + pg_off, mask=k_mask[:, None] & mt, other=0.0)
+
+                k_dyn = e_k * p_gate
+                v_dyn = e_v * p_gate
+
+                q_ptrs = Q + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
+                q_t = tl.load(q_ptrs, mask=mt, other=0.0)
+
+                s_t = tl.sum(q_t[None, :] * k_dyn, axis=1) / math.sqrt(hd)
+                valid = valid_k & mt
+                s_t = tl.where(valid, s_t, float('-inf'))
+
+                m_ptr = M_ptr + b * H * L + h * L + t_global
+                l_ptr = L_ptr + b * H * L + h * L + t_global
+                o_ptrs = Out + b * stride_qb + h * stride_qh + t_global * stride_ql + offs_d * stride_qd
+
+                if kc == 0:
+                    m_old = -float('inf')
+                    l_old = (V_total - K_max).to(tl.float32)
+                    o_old = tl.zeros((hd,), dtype=tl.float32)
+                else:
+                    m_old = tl.load(m_ptr, mask=mt, other=float('-inf'))
+                    l_old = tl.load(l_ptr, mask=mt, other=0.0)
+                    o_old = tl.load(o_ptrs, mask=mt, other=0.0)
+
+                m_chunk = tl.max(s_t)
+                m_new = tl.maximum(m_old, m_chunk)
+                alpha = tl.exp(m_old - m_new)
+                exp_s = tl.where(valid, tl.exp(s_t - m_new), 0.0)
+
+                l_new = l_old * alpha + tl.sum(exp_s)
+                o_new = o_old * alpha + tl.sum(exp_s[:, None] * v_dyn, axis=0)
+
+                tl.store(m_ptr, m_new, mask=mt)
+                tl.store(l_ptr, l_new, mask=mt)
+                tl.store(o_ptrs, o_new, mask=mt)
+
+                if kc == num_k_chunks - 1:
+                    lse_val = m_new + tl.log(l_new)
+                    lse_ptr = LSE_out + b * H * L + h * L + t_global
+                    tl.store(lse_ptr, lse_val, mask=mt)
+
+
+def flash_ema_forward_v2(Q, E_k_active, E_v_active, W_pe, V_total, unique_tensor, K_max, c_all, use_silu=True, Br=64):
+    """Decomposed forward: cuBLAS gate projection + Triton attention kernel."""
+    B, H, L, hd = Q.shape
+    D = H * hd
+    device = Q.device
+    N = rhos.shape[0]
+
+    E_k = E_k_active.view(B, K_max, H, hd).contiguous()
+    E_v = E_v_active.view(B, K_max, H, hd).contiguous()
+
+    # ── Stage 1: Gate projection via cuBLAS (one large matmul per time chunk) ──
+    # c_all: [B, L, K_max, N], W_pe: [N, D] (transposed from pe_proj.weight)
+    # P_gate = SiLU(c_all @ W_pe) → [B, L, K_max, D]
+    # Process in time chunks of Br to limit memory
+    P_gate = torch.empty(B, L, K_max, D, device=device, dtype=torch.float32)
+
+    num_chunks = max(1, triton.cdiv(L, Br))
+    for tc in range(num_chunks):
+        t_start = tc * Br
+        t_end = min(t_start + Br, L)
+        t_len = t_end - t_start
+
+        # [B * t_len * K_max, N] × [N, D] → [B * t_len * K_max, D]
+        c_chunk = c_all[:, t_start:t_end, :, :].reshape(-1, N)
+        pre_act = c_chunk @ W_pe  # cuBLAS handles this efficiently
+        if use_silu:
+            import torch.nn.functional as F
+            pg = F.silu(pre_act)
+        else:
+            pg = pre_act
+        P_gate[:, t_start:t_end, :, :] = pg.view(B, t_len, K_max, D)
+
+    # Reshape P_gate to [B, L, K_max, H, hd] for per-head access in kernel
+    P_gate = P_gate.view(B, L, K_max, H, hd).contiguous()
+
+    # ── Stage 2: Attention kernel (no gate computation, just loads P_gate) ──
+    O = torch.zeros_like(Q)
+    M_val = torch.full((B, H, L), float('-inf'), device=device, dtype=torch.float32)
+    L_val = torch.full((B, H, L), float(V_total - K_max), device=device, dtype=torch.float32)
+    LSE = torch.empty((B, H, L), device=device, dtype=torch.float32)
+
+    BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+    num_k_chunks = triton.cdiv(K_max, BLOCK_K)
+
+    grid = (B * H, num_chunks)
+    _attn_with_gate[grid](
+        Q, E_k, E_v, P_gate, unique_tensor,
+        O, M_val, L_val, LSE,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        B, H, L, hd, K_max, V_total,
+        num_k_chunks,
+        BLOCK_M=Br, BLOCK_K=BLOCK_K,
+    )
+
+    O = O / L_val.unsqueeze(-1)
+    return O, LSE, P_gate, E_k, E_v
+
+
+# ─────────────────────────────────────────────────
+# 2. Original Forward Kernel (kept for backward compatibility)
 # ─────────────────────────────────────────────────
 if HAS_TRITON:
     @triton.jit
@@ -669,3 +877,71 @@ class FlashEMAFunction(torch.autograd.Function):
 
         # Arguments: Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, C_bounds, use_silu, Br
         return dQ_out, None, dE_k_active, dE_v_active, dW_pe_final, None, None, None, None, None, None, None
+
+
+class FlashEMAFunctionV2(torch.autograd.Function):
+    """V2: cuBLAS gate projection in forward, old Triton kernels for backward."""
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
+    def forward(ctx, Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, c_all, C_bounds, use_silu=True, Br=64):
+        O, LSE, P_gate, E_k, E_v = \
+            flash_ema_forward_v2(Q, E_k_active, E_v_active, W_pe, V_total, unique_tensor, K_max, c_all, use_silu, Br)
+        # Save tensors needed by backward (still uses old Triton kernels)
+        ctx.save_for_backward(Q, x, E_k, E_v, W_pe, rhos, C_bounds, unique_tensor, O, LSE)
+        ctx.K_max = K_max
+        ctx.V_total = V_total
+        ctx.use_silu = use_silu
+        ctx.Br = Br
+        return O
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, dO):
+        # Reuse the exact same backward as FlashEMAFunction
+        Q, x, E_k, E_v, W_pe, rhos, C_bounds, unique_tensor, O, LSE = ctx.saved_tensors
+        B, H, L, hd = Q.shape
+        K_max = ctx.K_max
+        Br = ctx.Br
+        N = rhos.shape[0]
+        BLOCK_N = max(N, 16)
+
+        num_chunks = max(1, triton.cdiv(L, Br))
+        BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+        num_k_chunks = triton.cdiv(K_max, BLOCK_K)
+
+        dO = dO.contiguous()
+        D_vals = (dO * O).sum(dim=-1).contiguous()
+
+        rhos_p, W_pe_p, _, _ = _pad_n_dim(rhos, W_pe.contiguous(), None, None, BLOCK_N)
+
+        dQ_out = torch.zeros_like(Q)
+        dE_k_partitioned = torch.zeros(B, H, K_max, hd, device=Q.device, dtype=Q.dtype)
+        dE_v_partitioned = torch.zeros(B, H, K_max, hd, device=Q.device, dtype=Q.dtype)
+        n_blocks = B * H * num_chunks
+        dW_pe_partitioned = torch.zeros(n_blocks, BLOCK_N, W_pe.shape[1], device=Q.device, dtype=Q.dtype)
+
+        doc_ids_dummy = torch.zeros(B, L, dtype=torch.int32, device=Q.device)
+
+        grid = (B * H, num_chunks)
+        common_args = (Q, x, E_k, E_v, W_pe_p, rhos_p, C_bounds, unique_tensor)
+        common_kwargs = dict(
+            doc_ids_ptr=doc_ids_dummy, has_doc_ids=False,
+            stride_qb=Q.stride(0), stride_qh=Q.stride(1),
+            stride_ql=Q.stride(2), stride_qd=Q.stride(3),
+            B=B, H=H, L=L, hd=hd, K_max=K_max, V_total=ctx.V_total,
+            num_chunks=num_chunks, num_k_chunks=num_k_chunks,
+            BLOCK_M=Br, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, USE_SILU=ctx.use_silu,
+        )
+
+        _flash_ema_bwd_dq_de[grid](*common_args, dO, D_vals, LSE,
+                                    dQ_out, dE_k_partitioned, dE_v_partitioned, **common_kwargs)
+        _flash_ema_bwd_dw[grid](*common_args, dO, D_vals, LSE,
+                                dW_pe_partitioned, **common_kwargs)
+
+        dE_k_active = dE_k_partitioned.permute(0, 2, 1, 3).contiguous().view(B, K_max, H * hd)
+        dE_v_active = dE_v_partitioned.permute(0, 2, 1, 3).contiguous().view(B, K_max, H * hd)
+        dW_pe_reduced = dW_pe_partitioned.sum(dim=0)
+        dW_pe_final = dW_pe_reduced[:N, :]
+
+        # Arguments: Q, x, E_k_active, E_v_active, W_pe, rhos, V_total, unique_tensor, K_max, c_all, C_bounds, use_silu, Br
+        return dQ_out, None, dE_k_active, dE_v_active, dW_pe_final, None, None, None, None, None, None, None, None
