@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from .flash_ema_attention import flash_ema_forward
 from .triton_ema_query import compute_query_ema_history
 from .triton_fused_gating import fused_apply_symmetric_query_gating
-from .triton_flash_ema import FlashEMAFunction, FlashEMAFunctionSplitK, HAS_TRITON, _build_unique_index, precompute_boundaries  # noqa: F401
+from .triton_flash_ema import FlashEMAFunction, HAS_TRITON, _build_unique_index, precompute_boundaries
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -55,9 +55,6 @@ class SlotAttentionLayer(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
         self.use_silu = use_silu
 
-        import os
-        self._use_splitk = os.environ.get('USE_V2', '0') == '1'
-
     def forward(self, x_q, x, E_slots, rhos, C_seq, unique_tensor=None, K_max=None, C_bounds=None):
         B, L, D = x_q.shape
         device = x.device
@@ -84,28 +81,20 @@ class SlotAttentionLayer(nn.Module):
             Q_mha = Q_t.view(B, L, H, hd).transpose(1, 2).contiguous()
             W_pe_t = self.pe_proj.weight.t().contiguous()
 
-            if self._use_splitk:
-                # Split-K: k-chunks run in parallel, then reduce
-                out_mha = FlashEMAFunctionSplitK.apply(
-                    Q_mha, x, E_k_active, E_v_active, W_pe_t, rhos, E_slots.shape[0],
-                    unique_tensor, K_max, C_bounds, self.use_silu
-                )
-            else:
-                # V1: original fused kernel
-                out_mha = FlashEMAFunction.apply(
-                    Q_mha, x, E_k_active, E_v_active, W_pe_t, rhos, E_slots.shape[0],
-                    unique_tensor, K_max, C_bounds, self.use_silu
-                )
+            out_mha = FlashEMAFunction.apply(
+                Q_mha, x, E_k_active, E_v_active, W_pe_t, rhos, E_slots.shape[0], unique_tensor, K_max, C_bounds, self.use_silu
+            )
             out = out_mha.transpose(1, 2).contiguous().view(B, L, D)
         else:
             # PyTorch fallback for macOS / correctness testing
+            # If unique_tensor was NOT None, we must simulate the dense matrices for local debugging
             if unique_tensor is not None:
                 memory_base = self.ln_kv(E_slots)
                 E_k_slots = self.k_proj(memory_base)
                 E_v_slots = self.v_proj(memory_base)
-
+                
             out = flash_ema_forward(
-                Q=Q_t, x=x, E_k_slots=E_k_slots, E_v_slots=E_v_slots,
+                Q=Q_t, x=x, E_k_slots=E_k_slots, E_v_slots=E_v_slots, 
                 rhos=rhos, pe_proj=self.pe_proj, n_heads=self.n_heads, use_silu=self.use_silu
             )
 
