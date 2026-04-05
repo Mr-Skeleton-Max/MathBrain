@@ -45,7 +45,7 @@ print(f"  c_all shape: {c_all.shape}, mean: {c_all.mean():.6f}, std: {c_all.std(
 print(f"  c_all abs max: {c_all.abs().max():.6f}")
 print(f"  c_all[0,0,:5,:4]:\n{c_all[0, 0, :5, :4]}")
 
-O_v2, LSE_v2, P_gate, _, _ = flash_ema_forward_v2(
+O_v2, LSE_v2, _, _, _ = flash_ema_forward_v2(
     Q, E_k, E_v, W_pe, V, unique_tensor, K_max, c_all, use_silu=True
 )
 print(f"  O_v2 shape: {O_v2.shape}, mean: {O_v2.mean():.6f}, std: {O_v2.std():.6f}")
@@ -72,15 +72,9 @@ else:
     idx = tuple(reversed(idx))
     print(f"  Worst at {idx}: V1={O_v1[idx]:.6f}, V2={O_v2[idx]:.6f}")
 
-    # Debug: check P_gate sample
-    print(f"\n  P_gate shape: {P_gate.shape}")
-    print(f"  P_gate mean: {P_gate.mean():.6f}, std: {P_gate.std():.6f}")
-    print(f"  P_gate[0, 0, :5, 0, :4]:\n{P_gate[0, 0, :5, 0, :4]}")
-
-    # Also manually compute gate for comparison
+    # Manual gate computation for reference
     print("\n  Manual gate check (first timestep, first k-slots, head 0):")
     c0 = c_all[0, 0, :5, :]  # [5, N]
     w0 = W_pe[:, :hd]  # [N, hd] for head 0
     manual_gate = torch.nn.functional.silu(c0 @ w0)  # [5, hd]
-    print(f"  Manual: {manual_gate[:, :4]}")
-    print(f"  P_gate: {P_gate[0, 0, :5, 0, :4]}")
+    print(f"  Manual gate values: {manual_gate[:, :4]}")

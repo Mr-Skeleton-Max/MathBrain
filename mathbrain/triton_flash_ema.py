@@ -264,7 +264,8 @@ if HAS_TRITON:
 
 
 def flash_ema_forward_v2(Q, E_k_active, E_v_active, W_pe, V_total, unique_tensor, K_max, c_all, use_silu=True, Br=64):
-    """Decomposed forward: cuBLAS gate projection + Triton attention kernel."""
+    """Decomposed forward: cuBLAS gate projection + Triton attention kernel.
+    Processes one time chunk at a time to avoid P_gate memory explosion."""
     B, H, L, hd = Q.shape
     D = H * hd
     device = Q.device
@@ -273,52 +274,50 @@ def flash_ema_forward_v2(Q, E_k_active, E_v_active, W_pe, V_total, unique_tensor
     E_k = E_k_active.view(B, K_max, H, hd).contiguous()
     E_v = E_v_active.view(B, K_max, H, hd).contiguous()
 
-    # ── Stage 1: Gate projection via cuBLAS (one large matmul per time chunk) ──
-    # c_all: [B, L, K_max, N], W_pe: [N, D] (transposed from pe_proj.weight)
-    # P_gate = SiLU(c_all @ W_pe) → [B, L, K_max, D]
-    # Process in time chunks of Br to limit memory
-    P_gate = torch.empty(B, L, K_max, D, device=device, dtype=torch.float32)
+    O = torch.zeros_like(Q)
+    LSE = torch.empty((B, H, L), device=device, dtype=torch.float32)
 
+    BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
+    num_k_chunks = triton.cdiv(K_max, BLOCK_K)
     num_chunks = max(1, triton.cdiv(L, Br))
+
+    import torch.nn.functional as F
+
+    # Process one time chunk at a time: cuBLAS gate → attention kernel → copy back
     for tc in range(num_chunks):
         t_start = tc * Br
         t_end = min(t_start + Br, L)
         t_len = t_end - t_start
 
-        # [B * t_len * K_max, N] × [N, D] → [B * t_len * K_max, D]
+        # ── Gate projection for this chunk via cuBLAS ──
         c_chunk = c_all[:, t_start:t_end, :, :].reshape(-1, N)
-        pre_act = c_chunk @ W_pe  # cuBLAS handles this efficiently
-        if use_silu:
-            import torch.nn.functional as F
-            pg = F.silu(pre_act)
-        else:
-            pg = pre_act
-        P_gate[:, t_start:t_end, :, :] = pg.view(B, t_len, K_max, D)
+        pre_act = c_chunk @ W_pe
+        pg = F.silu(pre_act) if use_silu else pre_act
+        P_gate_chunk = pg.view(B, t_len, K_max, H, hd).contiguous()
 
-    # Reshape P_gate to [B, L, K_max, H, hd] for per-head access in kernel
-    P_gate = P_gate.view(B, L, K_max, H, hd).contiguous()
+        # ── Per-chunk contiguous tensors for kernel ──
+        Q_chunk = Q[:, :, t_start:t_end, :].contiguous()       # [B, H, t_len, hd]
+        O_chunk = torch.zeros(B, H, t_len, hd, device=device, dtype=Q.dtype)
+        M_chunk = torch.full((B, H, t_len), float('-inf'), device=device, dtype=torch.float32)
+        L_chunk = torch.full((B, H, t_len), float(V_total - K_max), device=device, dtype=torch.float32)
+        LSE_chunk = torch.empty(B, H, t_len, device=device, dtype=torch.float32)
 
-    # ── Stage 2: Attention kernel (no gate computation, just loads P_gate) ──
-    O = torch.zeros_like(Q)
-    M_val = torch.full((B, H, L), float('-inf'), device=device, dtype=torch.float32)
-    L_val = torch.full((B, H, L), float(V_total - K_max), device=device, dtype=torch.float32)
-    LSE = torch.empty((B, H, L), device=device, dtype=torch.float32)
+        # ── Attention kernel for this single time chunk ──
+        grid = (B * H, 1)
+        _attn_with_gate[grid](
+            Q_chunk, E_k, E_v, P_gate_chunk, unique_tensor,
+            O_chunk, M_chunk, L_chunk, LSE_chunk,
+            Q_chunk.stride(0), Q_chunk.stride(1), Q_chunk.stride(2), Q_chunk.stride(3),
+            B, H, t_len, hd, K_max, V_total,
+            num_k_chunks,
+            BLOCK_M=Br, BLOCK_K=BLOCK_K,
+        )
 
-    BLOCK_K = max(16, min(64, triton.next_power_of_2(K_max)))
-    num_k_chunks = triton.cdiv(K_max, BLOCK_K)
+        # ── Copy back to full tensors ──
+        O[:, :, t_start:t_end, :] = O_chunk / L_chunk.unsqueeze(-1)
+        LSE[:, :, t_start:t_end] = M_chunk + torch.log(L_chunk)
 
-    grid = (B * H, num_chunks)
-    _attn_with_gate[grid](
-        Q, E_k, E_v, P_gate, unique_tensor,
-        O, M_val, L_val, LSE,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        B, H, L, hd, K_max, V_total,
-        num_k_chunks,
-        BLOCK_M=Br, BLOCK_K=BLOCK_K,
-    )
-
-    O = O / L_val.unsqueeze(-1)
-    return O, LSE, P_gate, E_k, E_v
+    return O, LSE, None, E_k, E_v
 
 
 # ─────────────────────────────────────────────────
